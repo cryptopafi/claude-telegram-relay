@@ -10,7 +10,9 @@
 import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join } from "path";
+import { join, dirname } from "path";
+
+const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 // ============================================================
 // CONFIGURATION
@@ -311,13 +313,21 @@ bot.on("message:document", async (ctx) => {
 // HELPERS
 // ============================================================
 
-function buildPrompt(userMessage: string): string {
-  // Add context to every prompt
-  // Customize this for your use case
+// Load profile once at startup
+let profileContext = "";
+try {
+  profileContext = await readFile(join(PROJECT_ROOT, "config", "profile.md"), "utf-8");
+} catch {
+  // No profile yet — that's fine
+}
 
+const USER_NAME = process.env.USER_NAME || "";
+const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+function buildPrompt(userMessage: string): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
-    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    timeZone: USER_TIMEZONE,
     weekday: "long",
     year: "numeric",
     month: "long",
@@ -326,13 +336,16 @@ function buildPrompt(userMessage: string): string {
     minute: "2-digit",
   });
 
-  return `
-You are responding via Telegram. Keep responses concise.
+  const parts = [
+    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+  ];
 
-Current time: ${timeStr}
+  if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
+  parts.push(`Current time: ${timeStr}`);
+  if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
+  parts.push(`\nUser: ${userMessage}`);
 
-User: ${userMessage}
-`.trim();
+  return parts.join("\n");
 }
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
