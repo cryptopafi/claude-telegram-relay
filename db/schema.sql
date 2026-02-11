@@ -1,9 +1,13 @@
--- Optional: Supabase Schema for Cloud Memory
--- Run this in Supabase SQL Editor if you want cloud persistence
+-- Supabase Schema for Persistent Memory
+-- Run this in Supabase SQL Editor (or via Supabase MCP)
 -- This enables: conversation history, semantic search, goals tracking
+--
+-- After running this, set up the embed Edge Function and database webhook
+-- so embeddings are generated automatically on every INSERT.
 
--- Enable vector extension for semantic search (optional)
+-- Required extensions
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_net;
 
 -- ============================================================
 -- MESSAGES TABLE (Conversation History)
@@ -123,8 +127,10 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- SEMANTIC SEARCH (Optional - requires embeddings)
+-- SEMANTIC SEARCH
 -- ============================================================
+-- Embeddings are generated automatically by the embed Edge Function
+-- via database webhook. The search Edge Function calls these RPCs.
 
 -- Match messages by embedding similarity
 CREATE OR REPLACE FUNCTION match_messages(
@@ -148,6 +154,35 @@ BEGIN
     m.created_at,
     1 - (m.embedding <=> query_embedding) AS similarity
   FROM messages m
+  WHERE m.embedding IS NOT NULL
+    AND 1 - (m.embedding <=> query_embedding) > match_threshold
+  ORDER BY m.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Match memory entries by embedding similarity
+CREATE OR REPLACE FUNCTION match_memory(
+  query_embedding VECTOR(1536),
+  match_threshold FLOAT DEFAULT 0.7,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  id UUID,
+  content TEXT,
+  type TEXT,
+  created_at TIMESTAMPTZ,
+  similarity FLOAT
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    m.id,
+    m.content,
+    m.type,
+    m.created_at,
+    1 - (m.embedding <=> query_embedding) AS similarity
+  FROM memory m
   WHERE m.embedding IS NOT NULL
     AND 1 - (m.embedding <=> query_embedding) > match_threshold
   ORDER BY m.embedding <=> query_embedding
