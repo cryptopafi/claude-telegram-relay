@@ -18,6 +18,8 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { extractUrlContent, formatExtractedContent } from "./url-handler.ts";
+import { saveToSharedMemory, parseSaveTags } from "./memory-sync.ts";
 import { appendToLog } from "./file-logger.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -28,13 +30,25 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
-const CLAUDE_PATH = process.env.CLAUDE_PATH || "/Users/pafi/.local/bin/claude";
+const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 
 // Directories
+const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-Users-pafi/memory");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
+
+// Conversation history for context continuity
+const HISTORY_FILE = join(RELAY_DIR, "conversation-history.json");
+const MAX_HISTORY_MESSAGES = 20; // Keep last 20 exchanges (10 user + 10 assistant)
+const MAX_HISTORY_CHARS = 8000; // Cap total history size to avoid huge prompts
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+}
 
 // Session tracking for conversation continuity
 const SESSION_FILE = join(RELAY_DIR, "session.json");
@@ -62,6 +76,52 @@ async function saveSession(state: SessionState): Promise<void> {
 }
 
 let session = await loadSession();
+
+// ============================================================
+// CONVERSATION HISTORY
+// ============================================================
+
+let chatHistory: ChatMessage[] = [];
+
+async function loadHistory(): Promise<void> {
+  try {
+    const content = await readFile(HISTORY_FILE, "utf-8");
+    chatHistory = JSON.parse(content);
+  } catch {
+    chatHistory = [];
+  }
+}
+
+async function addToHistory(role: "user" | "assistant", content: string): Promise<void> {
+  chatHistory.push({
+    role,
+    content: content.substring(0, 2000), // Truncate very long messages
+    timestamp: new Date().toISOString(),
+  });
+  // Keep only the last N messages
+  if (chatHistory.length > MAX_HISTORY_MESSAGES) {
+    chatHistory = chatHistory.slice(-MAX_HISTORY_MESSAGES);
+  }
+  await writeFile(HISTORY_FILE, JSON.stringify(chatHistory, null, 2));
+}
+
+function formatHistory(): string {
+  if (chatHistory.length === 0) return "";
+  let historyText = "CONVERSATION HISTORY (recent messages):\n";
+  let totalChars = 0;
+  // Build from most recent, stop when we hit the char limit
+  const recent = [...chatHistory].reverse();
+  const included: string[] = [];
+  for (const msg of recent) {
+    const line = `${msg.role === "user" ? "Pafi" : "Assistant"}: ${msg.content}`;
+    if (totalChars + line.length > MAX_HISTORY_CHARS) break;
+    included.unshift(line);
+    totalChars += line.length;
+  }
+  return historyText + included.join("\n");
+}
+
+await loadHistory();
 
 // ============================================================
 // LOCK FILE (prevent multiple instances)
@@ -188,8 +248,7 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; imagePath?: string }
 ): Promise<string> {
-  const claudeBin = CLAUDE_PATH === "claude" ? "/Users/pafi/.local/bin/claude" : CLAUDE_PATH;
-  const args = [claudeBin, "-p", prompt];
+  const args = [CLAUDE_PATH, "-p", prompt];
 
   // Resume previous session if available and requested
   if (options?.resume && session.sessionId) {
@@ -217,7 +276,7 @@ async function callClaude(
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
-      console.error("Claude error:", stderr);
+      console.error("Claude error (exit " + exitCode + "):", "stdout:", output.substring(0,500), "stderr:", stderr.substring(0,500));
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
@@ -248,20 +307,36 @@ bot.on("message:text", async (ctx) => {
   await ctx.replyWithChatAction("typing");
 
   await saveMessage("user", text);
+  await addToHistory("user", text);
   await appendToLog("user", text);
 
-  // Gather context: semantic search + facts/goals
-  const [relevantContext, memoryContext] = await Promise.all([
+  // Gather context: semantic search + facts/goals + conversation history + URLs
+  const [relevantContext, memoryContext, sharedMemory, urlContents] = await Promise.all([
     getRelevantContext(supabase, text),
     getMemoryContext(supabase),
+    loadSharedMemory(),
+    extractUrlContent(text),
   ]);
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
+  const history = formatHistory();
+  const urlContext = formatExtractedContent(urlContents);
+  let enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, sharedMemory);
+  if (urlContext) {
+    enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
+  }
+  if (history) {
+    enrichedPrompt = history + "\n\n" + enrichedPrompt;
+  }
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+  // Parse memory intents and save tags
+  const afterMemory = await processMemoryIntents(supabase, rawResponse);
+  const { cleaned: response, notes } = parseSaveTags(afterMemory);
+  for (const note of notes) {
+    await saveToSharedMemory(note);
+  }
 
+  await addToHistory("assistant", response);
   await saveMessage("assistant", response);
   await appendToLog("assistant", response);
   await sendResponse(ctx, response);
@@ -411,13 +486,29 @@ try {
   // No profile yet — that's fine
 }
 
+// Load shared memory from git-synced files (refreshed on each message)
+async function loadSharedMemory(): Promise<string> {
+  const parts: string[] = [];
+  try {
+    const memory = await readFile(join(MEMORY_DIR, "MEMORY.md"), "utf-8");
+    parts.push("SHARED MEMORY (from Claude Code sessions):\n" + memory);
+  } catch {}
+  try {
+    const session = await readFile(join(MEMORY_DIR, "session-2026-02-13-decisions.md"), "utf-8");
+    // Only include first 2000 chars to keep prompt reasonable
+    parts.push("LATEST SESSION DECISIONS:\n" + session.substring(0, 2000));
+  } catch {}
+  return parts.join("\n\n");
+}
+
 const USER_NAME = process.env.USER_NAME || "";
 const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 function buildPrompt(
   userMessage: string,
   relevantContext?: string,
-  memoryContext?: string
+  memoryContext?: string,
+  sharedMemory?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -437,6 +528,7 @@ function buildPrompt(
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
+  if (sharedMemory) parts.push(`\n${sharedMemory}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
 
@@ -446,10 +538,16 @@ function buildPrompt(
       "include these tags in your response (they are processed automatically and hidden from the user):" +
       "\n[REMEMBER: fact to store]" +
       "\n[GOAL: goal text | DEADLINE: optional date]" +
-      "\n[DONE: search text for completed goal]"
+      "\n[DONE: search text for completed goal]" +
+      "\n[SAVE: important note to sync across all devices]" +
+      "\n\nURL HANDLING:" +
+      "\nWhen the user sends a YouTube link or URL, the content has been auto-extracted above. " +
+      "Summarize or answer questions about it naturally."
   );
 
   parts.push(`\nUser: ${userMessage}`);
+
+  // Note: conversation history is prepended by the caller
 
   return parts.join("\n");
 }
@@ -501,4 +599,3 @@ bot.start({
     console.log("Bot is running!");
   },
 });
-// Cache buster: 1771068451
