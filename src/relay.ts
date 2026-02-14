@@ -18,6 +18,7 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { appendToLog } from "./file-logger.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -27,7 +28,7 @@ const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
-const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
+const CLAUDE_PATH = process.env.CLAUDE_PATH || "/Users/pafi/.local/bin/claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 
@@ -187,7 +188,8 @@ async function callClaude(
   prompt: string,
   options?: { resume?: boolean; imagePath?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  const claudeBin = CLAUDE_PATH === "claude" ? "/Users/pafi/.local/bin/claude" : CLAUDE_PATH;
+  const args = [claudeBin, "-p", prompt];
 
   // Resume previous session if available and requested
   if (options?.resume && session.sessionId) {
@@ -246,6 +248,7 @@ bot.on("message:text", async (ctx) => {
   await ctx.replyWithChatAction("typing");
 
   await saveMessage("user", text);
+  await appendToLog("user", text);
 
   // Gather context: semantic search + facts/goals
   const [relevantContext, memoryContext] = await Promise.all([
@@ -260,6 +263,7 @@ bot.on("message:text", async (ctx) => {
   const response = await processMemoryIntents(supabase, rawResponse);
 
   await saveMessage("assistant", response);
+  await appendToLog("assistant", response);
   await sendResponse(ctx, response);
 });
 
@@ -290,6 +294,7 @@ bot.on("message:voice", async (ctx) => {
     }
 
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
+    await appendToLog("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
     const [relevantContext, memoryContext] = await Promise.all([
       getRelevantContext(supabase, transcription),
@@ -305,6 +310,7 @@ bot.on("message:voice", async (ctx) => {
     const claudeResponse = await processMemoryIntents(supabase, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
+    await appendToLog("assistant", claudeResponse);
     await sendResponse(ctx, claudeResponse);
   } catch (error) {
     console.error("Voice error:", error);
@@ -338,6 +344,7 @@ bot.on("message:photo", async (ctx) => {
     const prompt = `[Image: ${filePath}]\n\n${caption}`;
 
     await saveMessage("user", `[Image]: ${caption}`);
+    await appendToLog("user", `[Image]: ${caption}`);
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
@@ -346,6 +353,7 @@ bot.on("message:photo", async (ctx) => {
 
     const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
     await saveMessage("assistant", cleanResponse);
+    await appendToLog("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
     console.error("Image error:", error);
@@ -375,6 +383,7 @@ bot.on("message:document", async (ctx) => {
     const prompt = `[File: ${filePath}]\n\n${caption}`;
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
+    await appendToLog("user", `[Document: ${doc.file_name}]: ${caption}`);
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
@@ -382,6 +391,7 @@ bot.on("message:document", async (ctx) => {
 
     const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
     await saveMessage("assistant", cleanResponse);
+    await appendToLog("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
     console.error("Document error:", error);
@@ -491,3 +501,4 @@ bot.start({
     console.log("Bot is running!");
   },
 });
+// Cache buster: 1771068451
