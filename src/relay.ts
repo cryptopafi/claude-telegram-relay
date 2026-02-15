@@ -30,6 +30,9 @@ import {
   processProcedureTags,
 } from "./cortex-client.ts";
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
+import { textToSpeech, cleanupTTS } from "./tts.ts";
+import { createReadStream } from "fs";
+import { InputFile } from "grammy";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -728,37 +731,52 @@ function buildPrompt(
   return parts.join("\n");
 }
 
+// TTS enabled via env var (default: on)
+const TTS_ENABLED = process.env.TTS_ENABLED !== "false";
+
 async function sendResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
 
   if (response.length <= MAX_LENGTH) {
     await ctx.reply(response);
-    return;
-  }
+  } else {
+    // Split long responses
+    const chunks = [];
+    let remaining = response;
 
-  // Split long responses
-  const chunks = [];
-  let remaining = response;
+    while (remaining.length > 0) {
+      if (remaining.length <= MAX_LENGTH) {
+        chunks.push(remaining);
+        break;
+      }
 
-  while (remaining.length > 0) {
-    if (remaining.length <= MAX_LENGTH) {
-      chunks.push(remaining);
-      break;
+      let splitIndex = remaining.lastIndexOf("\n\n", MAX_LENGTH);
+      if (splitIndex === -1) splitIndex = remaining.lastIndexOf("\n", MAX_LENGTH);
+      if (splitIndex === -1) splitIndex = remaining.lastIndexOf(" ", MAX_LENGTH);
+      if (splitIndex === -1) splitIndex = MAX_LENGTH;
+
+      chunks.push(remaining.substring(0, splitIndex));
+      remaining = remaining.substring(splitIndex).trim();
     }
 
-    // Try to split at a natural boundary
-    let splitIndex = remaining.lastIndexOf("\n\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf("\n", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = remaining.lastIndexOf(" ", MAX_LENGTH);
-    if (splitIndex === -1) splitIndex = MAX_LENGTH;
-
-    chunks.push(remaining.substring(0, splitIndex));
-    remaining = remaining.substring(splitIndex).trim();
+    for (const chunk of chunks) {
+      await ctx.reply(chunk);
+    }
   }
 
-  for (const chunk of chunks) {
-    await ctx.reply(chunk);
+  // Send voice version (non-blocking, after text)
+  if (TTS_ENABLED) {
+    try {
+      const audioPath = await textToSpeech(response);
+      if (audioPath) {
+        await ctx.replyWithVoice(new InputFile(audioPath));
+        await cleanupTTS(audioPath);
+      }
+    } catch (error) {
+      console.error("TTS send error:", error);
+      // Silently fail - text was already sent
+    }
   }
 }
 
