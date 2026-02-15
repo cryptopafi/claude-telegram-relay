@@ -21,6 +21,12 @@ import {
 import { extractUrlContent, formatExtractedContent } from "./url-handler.ts";
 import { saveToSharedMemory, parseSaveTags } from "./memory-sync.ts";
 import { appendToLog } from "./file-logger.ts";
+import {
+  processCortexMemoryIntents,
+  getCortexContext,
+  getCortexRulesContext,
+  storeTelegramMessage,
+} from "./cortex-client.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -309,18 +315,21 @@ bot.on("message:text", async (ctx) => {
   await saveMessage("user", text);
   await addToHistory("user", text);
   await appendToLog("user", text);
+  await storeTelegramMessage("user", text);
 
-  // Gather context: semantic search + facts/goals + conversation history + URLs
-  const [relevantContext, memoryContext, sharedMemory, urlContents] = await Promise.all([
+  // Gather context: semantic search + facts/goals + conversation history + URLs + Cortex
+  const [relevantContext, memoryContext, sharedMemory, urlContents, cortexContext, cortexRules] = await Promise.all([
     getRelevantContext(supabase, text),
     getMemoryContext(supabase),
     loadSharedMemory(),
     extractUrlContent(text),
+    getCortexContext(text),
+    getCortexRulesContext(),
   ]);
 
   const history = formatHistory();
   const urlContext = formatExtractedContent(urlContents);
-  let enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, sharedMemory);
+  let enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, sharedMemory, cortexContext, cortexRules);
   if (urlContext) {
     enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
   }
@@ -331,7 +340,8 @@ bot.on("message:text", async (ctx) => {
 
   // Parse memory intents and save tags
   const afterMemory = await processMemoryIntents(supabase, rawResponse);
-  const { cleaned: response, notes } = parseSaveTags(afterMemory);
+  const afterCortex = await processCortexMemoryIntents(afterMemory);
+  const { cleaned: response, notes } = parseSaveTags(afterCortex);
   for (const note of notes) {
     await saveToSharedMemory(note);
   }
@@ -339,6 +349,7 @@ bot.on("message:text", async (ctx) => {
   await addToHistory("assistant", response);
   await saveMessage("assistant", response);
   await appendToLog("assistant", response);
+  await storeTelegramMessage("assistant", response);
   await sendResponse(ctx, response);
 });
 
@@ -370,22 +381,30 @@ bot.on("message:voice", async (ctx) => {
 
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
     await appendToLog("user", `[Voice ${voice.duration}s]: ${transcription}`);
+    await storeTelegramMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext] = await Promise.all([
+    const [relevantContext, memoryContext, cortexContext, cortexRules] = await Promise.all([
       getRelevantContext(supabase, transcription),
       getMemoryContext(supabase),
+      getCortexContext(transcription),
+      getCortexRulesContext(),
     ]);
 
     const enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
-      memoryContext
+      memoryContext,
+      undefined,
+      cortexContext,
+      cortexRules
     );
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const afterMemory = await processMemoryIntents(supabase, rawResponse);
+    const claudeResponse = await processCortexMemoryIntents(afterMemory);
 
     await saveMessage("assistant", claudeResponse);
     await appendToLog("assistant", claudeResponse);
+    await storeTelegramMessage("assistant", claudeResponse);
     await sendResponse(ctx, claudeResponse);
   } catch (error) {
     console.error("Voice error:", error);
@@ -420,15 +439,18 @@ bot.on("message:photo", async (ctx) => {
 
     await saveMessage("user", `[Image]: ${caption}`);
     await appendToLog("user", `[Image]: ${caption}`);
+    await storeTelegramMessage("user", `[Image]: ${caption}`);
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const afterMemory = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = await processCortexMemoryIntents(afterMemory);
     await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
+    await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
     console.error("Image error:", error);
@@ -459,14 +481,17 @@ bot.on("message:document", async (ctx) => {
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
     await appendToLog("user", `[Document: ${doc.file_name}]: ${caption}`);
+    await storeTelegramMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
     const claudeResponse = await callClaude(prompt, { resume: true });
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const afterMemory = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = await processCortexMemoryIntents(afterMemory);
     await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
+    await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
     console.error("Document error:", error);
@@ -508,7 +533,9 @@ function buildPrompt(
   userMessage: string,
   relevantContext?: string,
   memoryContext?: string,
-  sharedMemory?: string
+  sharedMemory?: string,
+  cortexContext?: string,
+  cortexRules?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -527,10 +554,12 @@ function buildPrompt(
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr}`);
+  if (cortexRules) parts.push(`\n${cortexRules}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (sharedMemory) parts.push(`\n${sharedMemory}`);
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
+  if (cortexContext) parts.push(`\n${cortexContext}`);
 
   parts.push(
     "\nMEMORY MANAGEMENT:" +
