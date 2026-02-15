@@ -20,6 +20,7 @@
     "grammy": "^1.21.1",
     "groq-sdk": "^0.8.0",
     "linkedom": "^0.18.12",
+    "otpauth": "^9.5.0",
     "youtube-caption-extractor": "^1.9.1"
   },
   "devDependencies": {

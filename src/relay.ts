@@ -29,6 +29,7 @@ import {
   getCortexProcedures,
   processProcedureTags,
 } from "./cortex-client.ts";
+import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -249,14 +250,58 @@ bot.use(async (ctx, next) => {
 });
 
 // ============================================================
+// MODEL ESCALATION
+// ============================================================
+
+type ModelLevel = "haiku" | "sonnet" | "opus";
+
+const OPUS_PATTERNS = [
+  /\b(design|architect|plan|strategy|strategic)\b/i,
+  /\b(review.*code|code.*review)\b/i,
+  /\b(tradeoffs?|trade-offs?|pros\s+and\s+cons)\b/i,
+  /\b(think\s+deeply|complex\s+analysis)\b/i,
+  /\b(redesign|refactor.*entire|system\s+design)\b/i,
+  /\b(security\s+review|audit)\b/i,
+];
+
+const SONNET_PATTERNS = [
+  /\b(implement|build|create|code|write\s+code)\b/i,
+  /\b(fix|debug|troubleshoot|solve)\b/i,
+  /\b(analyze|research|compare|evaluate)\b/i,
+  /\b(explain\s+in\s+detail|how\s+does.*work)\b/i,
+  /\b(refactor|optimize|improve)\b/i,
+  /\b(script|function|class|api|endpoint)\b/i,
+  /\b(install|configure|setup|deploy)\b/i,
+];
+
+function detectModelLevel(text: string): ModelLevel {
+  // Opus: design, architecture, strategy, complex reasoning
+  for (const pattern of OPUS_PATTERNS) {
+    if (pattern.test(text)) return "opus";
+  }
+
+  // Sonnet: coding, analysis, implementation
+  for (const pattern of SONNET_PATTERNS) {
+    if (pattern.test(text)) return "sonnet";
+  }
+
+  // Long messages (>300 chars) likely need more capability
+  if (text.length > 300) return "sonnet";
+
+  // Default: haiku for simple/short messages
+  return "haiku";
+}
+
+// ============================================================
 // CORE: Call Claude CLI
 // ============================================================
 
 async function callClaude(
   prompt: string,
-  options?: { resume?: boolean; imagePath?: string }
+  options?: { resume?: boolean; imagePath?: string; model?: ModelLevel }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  const model = options?.model || detectModelLevel(prompt);
+  const args = [CLAUDE_PATH, "-p", prompt, "--model", model];
 
   // Resume previous session if available and requested
   if (options?.resume && session.sessionId) {
@@ -265,7 +310,9 @@ async function callClaude(
 
   args.push("--output-format", "text");
 
-  console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
+  console.log(`[ESCALATION] Model: ${model} for prompt: ${prompt.substring(0, 80)}...`);
+
+  console.log(`Calling Claude (${model}): ${prompt.substring(0, 50)}...`);
 
   try {
     const proc = spawn(args, {
@@ -304,8 +351,73 @@ async function callClaude(
 }
 
 // ============================================================
+// TOTP PENDING STATE
+// ============================================================
+
+let pendingTOTP: {
+  ruleId: string;
+  action: string;
+  expiresAt: number;
+} | null = null;
+
+// ============================================================
 // MESSAGE HANDLERS
 // ============================================================
+
+// /totp_setup command - generate new TOTP secret (admin only)
+bot.command("totp_setup", async (ctx) => {
+  if (isTOTPConfigured()) {
+    await ctx.reply("TOTP deja configurat. Șterge TOTP_SECRET din .env pentru a regenera.");
+    return;
+  }
+  const setup = generateTOTPSetup();
+  await ctx.reply(setup.qrText);
+});
+
+// /rules command - list rules
+bot.command("rules", async (ctx) => {
+  const arg = ctx.match?.trim();
+  if (arg === "hard" || arg === "standard" || arg === "soft" || arg === "temporary") {
+    const response = await callClaude(`List all ${arg.toUpperCase()} rules from Cortex. Format: rule_id - description`, { model: "haiku" });
+    await sendResponse(ctx, response);
+  } else {
+    await ctx.reply(
+      "Comenzi reguli:\n" +
+      "/rules hard - Reguli HARD (necesită TOTP)\n" +
+      "/rules standard - Reguli STANDARD\n" +
+      "/rules soft - Reguli SOFT\n" +
+      "/rules temporary - Reguli temporare\n" +
+      "/rule_modify RULE_ID - Modifică o regulă"
+    );
+  }
+});
+
+// /rule_modify command - modify a rule (HARD rules need TOTP)
+bot.command("rule_modify", async (ctx) => {
+  const ruleId = ctx.match?.trim().toUpperCase();
+  if (!ruleId) {
+    await ctx.reply("Folosire: /rule_modify RULE_ID\nExemplu: /rule_modify SEC-H-001");
+    return;
+  }
+
+  if (isHardRule(ruleId)) {
+    if (!isTOTPConfigured()) {
+      await ctx.reply("TOTP nu e configurat. Rulează /totp_setup mai întâi.");
+      return;
+    }
+    // Set pending state - user has 90 seconds to provide code
+    pendingTOTP = {
+      ruleId,
+      action: "modify",
+      expiresAt: Date.now() + 90_000,
+    };
+    await ctx.reply(`Regula ${ruleId} este HARD. Introdu codul TOTP din Google Authenticator (ai 90 secunde):`);
+    return;
+  }
+
+  // Non-HARD rules: proceed directly
+  await ctx.reply(`Descrie modificarea pentru ${ruleId}:`);
+});
 
 // Text messages
 bot.on("message:text", async (ctx) => {
@@ -313,6 +425,25 @@ bot.on("message:text", async (ctx) => {
   console.log(`Message: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
+
+  // Check for pending TOTP verification
+  if (pendingTOTP && /^\d{6}$/.test(text.trim())) {
+    if (Date.now() > pendingTOTP.expiresAt) {
+      pendingTOTP = null;
+      await ctx.reply("Codul TOTP a expirat. Folosește /rule_modify din nou.");
+      return;
+    }
+
+    if (verifyTOTP(text.trim())) {
+      const ruleId = pendingTOTP.ruleId;
+      pendingTOTP = null;
+      await ctx.reply(`TOTP verificat. Descrie modificarea pentru ${ruleId}:`);
+      // The next message will be handled as a normal rule modification
+    } else {
+      await ctx.reply("Cod TOTP incorect. Încearcă din nou (sau /rule_modify pentru a reîncepe).");
+    }
+    return;
+  }
 
   await saveMessage("user", text);
   await addToHistory("user", text);
