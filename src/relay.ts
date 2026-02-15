@@ -473,7 +473,8 @@ bot.on("message:text", async (ctx) => {
   if (history) {
     enrichedPrompt = history + "\n\n" + enrichedPrompt;
   }
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
+  const rawResponse = await callClaude(enrichedPrompt, { resume: true, model });
 
   // Parse memory intents, save tags, and store procedures
   const afterMemory = await processMemoryIntents(supabase, rawResponse);
@@ -540,7 +541,8 @@ bot.on("message:voice", async (ctx) => {
     if (cortexProcedures) {
       enrichedPrompt += "\n\n" + cortexProcedures;
     }
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    const voiceModel = detectModelLevel(transcription);
+    const rawResponse = await callClaude(enrichedPrompt, { resume: true, model: voiceModel });
     const afterMemory = await processMemoryIntents(supabase, rawResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const claudeResponse = await processProcedureTags(afterCortex);
