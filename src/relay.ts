@@ -725,13 +725,18 @@ function buildPrompt(
   if (cortexContext) parts.push(`\n${cortexContext}`);
 
   parts.push(
-    "\nMEMORY MANAGEMENT:" +
-      "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
-      "include these tags in your response (they are processed automatically and hidden from the user):" +
-      "\n[REMEMBER: fact to store]" +
-      "\n[GOAL: goal text | DEADLINE: optional date]" +
-      "\n[DONE: search text for completed goal]" +
-      "\n[SAVE: important note to sync across all devices]" +
+    "\nMEMORY MANAGEMENT (MANDATORY - you MUST use these tags):" +
+      "\nYou MUST include relevant tags in EVERY response where applicable. " +
+      "Tags are auto-processed and hidden from the user. NOT using tags when appropriate is a violation of MEM-H-001." +
+      "\n" +
+      "\n[REMEMBER: fact to store] — Use when: user shares preferences, decisions, important info" +
+      "\n[GOAL: goal text | DEADLINE: optional date] — Use when: user sets objectives or targets" +
+      "\n[DONE: search text for completed goal] — Use when: user reports completing something" +
+      "\n[SAVE: important note to sync across all devices] — Use when: cross-device info needed" +
+      "\n[PROCEDURE: problem | step1; step2; step3 | domain | tags | difficulty] — Use when: you solve a problem with clear steps" +
+      "\n" +
+      "\nAUTO-SAVE BACKUP: Important exchanges (decisions, fixes, procedures, architecture) are also auto-saved. " +
+      "But tags give you precise control. ALWAYS prefer explicit tags over relying on auto-save." +
       "\n\nURL HANDLING:" +
       "\nWhen the user sends a YouTube link or URL, the content has been auto-extracted above. " +
       "Summarize or answer questions about it naturally."
