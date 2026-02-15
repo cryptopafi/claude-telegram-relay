@@ -196,3 +196,188 @@ export async function storeTelegramMessage(
     timestamp: new Date().toISOString(),
   });
 }
+
+// ===== PROCEDURES =====
+
+interface Procedure {
+  id: string;
+  slug: string;
+  problem: string;
+  solution_steps: string[];
+  domain: string;
+  difficulty: string;
+  success_rate: number | null;
+  times_applied: number;
+}
+
+/**
+ * Store a procedure in Cortex
+ */
+async function storeProcedure(data: {
+  problem: string;
+  solution_steps: string[];
+  domain: string;
+  context?: string;
+  error_signatures?: string[];
+  verification?: string;
+  difficulty?: "easy" | "medium" | "hard";
+  tags?: string[];
+}): Promise<{ id: string; slug: string; status: string }> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (CORTEX_API_KEY) {
+      headers.Authorization = `Bearer ${CORTEX_API_KEY}`;
+    }
+
+    const response = await fetch(`${CORTEX_URL}/api/procedures`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      console.error("Cortex store procedure failed:", response.status);
+      return { id: "", slug: "", status: "error" };
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("Cortex store procedure error:", error);
+    return { id: "", slug: "", status: "error" };
+  }
+}
+
+/**
+ * Search procedures in Cortex
+ */
+async function searchProcedures(
+  query?: string,
+  error_signature?: string,
+  domain?: string,
+  limit: number = 3
+): Promise<Procedure[]> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (CORTEX_API_KEY) {
+      headers.Authorization = `Bearer ${CORTEX_API_KEY}`;
+    }
+
+    const body: any = { limit };
+    if (query) body.query = query;
+    if (error_signature) body.error_signature = error_signature;
+    if (domain) body.domain = domain;
+
+    const response = await fetch(`${CORTEX_URL}/api/procedures/search`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = await response.json();
+    return data.procedures || [];
+  } catch (error) {
+    console.error("Cortex search procedures error:", error);
+    return [];
+  }
+}
+
+/**
+ * Report procedure feedback to Cortex
+ */
+async function reportProcedureFeedback(
+  id: string,
+  feedback_type: "applied_success" | "applied_failure" | "wrong_match",
+  notes?: string
+): Promise<void> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (CORTEX_API_KEY) {
+      headers.Authorization = `Bearer ${CORTEX_API_KEY}`;
+    }
+
+    await fetch(`${CORTEX_URL}/api/procedures/${id}/feedback`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ feedback_type, notes }),
+    });
+  } catch (error) {
+    console.error("Cortex report feedback error:", error);
+  }
+}
+
+/**
+ * Get relevant procedures from Cortex for a problem
+ */
+export async function getCortexProcedures(query: string): Promise<string> {
+  const procedures = await searchProcedures(query, undefined, undefined, 3);
+
+  if (procedures.length === 0) {
+    return "";
+  }
+
+  return (
+    "RELEVANT PROCEDURES (from past solutions):\n" +
+    procedures
+      .map((p, i) => {
+        const quality = p.times_applied > 0
+          ? ` [Success: ${Math.round((p.success_rate || 0) * 100)}% (${p.times_applied} uses)]`
+          : " [Untested]";
+        const steps = p.solution_steps.map((s, idx) => `  ${idx + 1}. ${s}`).join("\n");
+        return `${i + 1}. ${p.problem} [${p.domain}]${quality}\nID: ${p.id}\n${steps}`;
+      })
+      .join("\n\n")
+  );
+}
+
+/**
+ * Parse [PROCEDURE] tags from Claude's response and store in Cortex.
+ * Format: [PROCEDURE: problem | solution1; solution2; solution3 | domain]
+ * Returns cleaned response.
+ */
+export async function processProcedureTags(response: string): Promise<string> {
+  let clean = response;
+
+  // [PROCEDURE: problem | steps | domain | tags? | difficulty?]
+  const procedureRegex = /\[PROCEDURE:\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|\]]+)(?:\s*\|\s*([^|\]]+))?(?:\s*\|\s*([^|\]]+))?\]/gi;
+
+  for (const match of response.matchAll(procedureRegex)) {
+    const problem = match[1].trim();
+    const solutionSteps = match[2].split(";").map((s) => s.trim()).filter(Boolean);
+    const domain = match[3].trim() as any;
+    const tags = match[4] ? match[4].split(",").map((t) => t.trim()) : [];
+    const difficulty = (match[5]?.trim() || "medium") as "easy" | "medium" | "hard";
+
+    if (problem && solutionSteps.length > 0 && domain) {
+      const result = await storeProcedure({
+        problem,
+        solution_steps: solutionSteps,
+        domain,
+        tags,
+        difficulty,
+      });
+
+      if (result.status === "stored") {
+        console.log(`Stored procedure: ${result.slug}`);
+      } else if (result.status === "duplicate") {
+        console.log(`Duplicate procedure detected: ${result.slug}`);
+      }
+    }
+
+    clean = clean.replace(match[0], "");
+  }
+
+  return clean.trim();
+}

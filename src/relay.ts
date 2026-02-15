@@ -26,6 +26,8 @@ import {
   getCortexContext,
   getCortexRulesContext,
   storeTelegramMessage,
+  getCortexProcedures,
+  processProcedureTags,
 } from "./cortex-client.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -317,19 +319,23 @@ bot.on("message:text", async (ctx) => {
   await appendToLog("user", text);
   await storeTelegramMessage("user", text);
 
-  // Gather context: semantic search + facts/goals + conversation history + URLs + Cortex
-  const [relevantContext, memoryContext, sharedMemory, urlContents, cortexContext, cortexRules] = await Promise.all([
+  // Gather context: semantic search + facts/goals + conversation history + URLs + Cortex + procedures
+  const [relevantContext, memoryContext, sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
     getRelevantContext(supabase, text),
     getMemoryContext(supabase),
     loadSharedMemory(),
     extractUrlContent(text),
     getCortexContext(text),
     getCortexRulesContext(),
+    getCortexProcedures(text),
   ]);
 
   const history = formatHistory();
   const urlContext = formatExtractedContent(urlContents);
   let enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, sharedMemory, cortexContext, cortexRules);
+  if (cortexProcedures) {
+    enrichedPrompt += "\n\n" + cortexProcedures;
+  }
   if (urlContext) {
     enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
   }
@@ -338,10 +344,11 @@ bot.on("message:text", async (ctx) => {
   }
   const rawResponse = await callClaude(enrichedPrompt, { resume: true });
 
-  // Parse memory intents and save tags
+  // Parse memory intents, save tags, and store procedures
   const afterMemory = await processMemoryIntents(supabase, rawResponse);
   const afterCortex = await processCortexMemoryIntents(afterMemory);
-  const { cleaned: response, notes } = parseSaveTags(afterCortex);
+  const afterProcedures = await processProcedureTags(afterCortex);
+  const { cleaned: response, notes } = parseSaveTags(afterProcedures);
   for (const note of notes) {
     await saveToSharedMemory(note);
   }
@@ -383,14 +390,15 @@ bot.on("message:voice", async (ctx) => {
     await appendToLog("user", `[Voice ${voice.duration}s]: ${transcription}`);
     await storeTelegramMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext, cortexContext, cortexRules] = await Promise.all([
+    const [relevantContext, memoryContext, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
       getRelevantContext(supabase, transcription),
       getMemoryContext(supabase),
       getCortexContext(transcription),
       getCortexRulesContext(),
+      getCortexProcedures(transcription),
     ]);
 
-    const enrichedPrompt = buildPrompt(
+    let enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       relevantContext,
       memoryContext,
@@ -398,9 +406,13 @@ bot.on("message:voice", async (ctx) => {
       cortexContext,
       cortexRules
     );
+    if (cortexProcedures) {
+      enrichedPrompt += "\n\n" + cortexProcedures;
+    }
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
     const afterMemory = await processMemoryIntents(supabase, rawResponse);
-    const claudeResponse = await processCortexMemoryIntents(afterMemory);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const claudeResponse = await processProcedureTags(afterCortex);
 
     await saveMessage("assistant", claudeResponse);
     await appendToLog("assistant", claudeResponse);
@@ -447,7 +459,8 @@ bot.on("message:photo", async (ctx) => {
     await unlink(filePath).catch(() => {});
 
     const afterMemory = await processMemoryIntents(supabase, claudeResponse);
-    const cleanResponse = await processCortexMemoryIntents(afterMemory);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const cleanResponse = await processProcedureTags(afterCortex);
     await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
@@ -488,7 +501,8 @@ bot.on("message:document", async (ctx) => {
     await unlink(filePath).catch(() => {});
 
     const afterMemory = await processMemoryIntents(supabase, claudeResponse);
-    const cleanResponse = await processCortexMemoryIntents(afterMemory);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const cleanResponse = await processProcedureTags(afterCortex);
     await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
