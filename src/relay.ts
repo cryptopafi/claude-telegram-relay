@@ -28,6 +28,8 @@ import {
   storeTelegramMessage,
   getCortexProcedures,
   processProcedureTags,
+  checkCortexHealth,
+  autoSaveToCortex,
 } from "./cortex-client.ts";
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
 import { textToSpeech, cleanupTTS } from "./tts.ts";
@@ -492,6 +494,8 @@ bot.on("message:text", async (ctx) => {
   await saveMessage("assistant", response);
   await appendToLog("assistant", response);
   await storeTelegramMessage("assistant", response);
+  // Auto-save important exchanges to Cortex (MEM-H-002)
+  autoSaveToCortex(text, response).catch(() => {});
   await sendResponse(ctx, response);
 });
 
@@ -553,6 +557,8 @@ bot.on("message:voice", async (ctx) => {
     await saveMessage("assistant", claudeResponse);
     await appendToLog("assistant", claudeResponse);
     await storeTelegramMessage("assistant", claudeResponse);
+    // Auto-save important exchanges to Cortex (MEM-H-002)
+    autoSaveToCortex(transcription, claudeResponse).catch(() => {});
     await sendResponse(ctx, claudeResponse);
   } catch (error) {
     console.error("Voice error:", error);
@@ -668,10 +674,17 @@ async function loadSharedMemory(): Promise<string> {
     const memory = await readFile(join(MEMORY_DIR, "MEMORY.md"), "utf-8");
     parts.push("SHARED MEMORY (from Claude Code sessions):\n" + memory);
   } catch {}
+  // Find latest session file dynamically
   try {
-    const session = await readFile(join(MEMORY_DIR, "session-2026-02-13-decisions.md"), "utf-8");
-    // Only include first 2000 chars to keep prompt reasonable
-    parts.push("LATEST SESSION DECISIONS:\n" + session.substring(0, 2000));
+    const { readdirSync } = require("fs");
+    const files = readdirSync(MEMORY_DIR)
+      .filter((f: string) => f.startsWith("session-") && f.endsWith(".md"))
+      .sort()
+      .reverse();
+    if (files.length > 0) {
+      const session = await readFile(join(MEMORY_DIR, files[0]), "utf-8");
+      parts.push("LATEST SESSION:\n" + session.substring(0, 2000));
+    }
   } catch {}
   return parts.join("\n\n");
 }
@@ -787,6 +800,11 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 console.log("Starting Claude Telegram Relay...");
 console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+
+// Check Cortex connectivity on startup
+checkCortexHealth().then((ok) => {
+  if (!ok) console.warn("[CORTEX] WARNING: Cortex unreachable — auto-save disabled until reconnect");
+});
 
 bot.start({
   onStart: () => {

@@ -2,11 +2,81 @@
  * Cortex Knowledge Base Client
  *
  * Connects the Telegram bot to Cortex for persistent knowledge storage.
- * Similar to memory.ts but uses Cortex REST API instead of Supabase.
+ * Bidirectional sync: READ (rules, procedures, context) + WRITE (decisions, procedures, conversations).
  */
 
 const CORTEX_URL = process.env.CORTEX_URL || "http://100.81.233.9:6400";
 const CORTEX_API_KEY = process.env.CORTEX_API_KEY || "";
+
+let cortexHealthy = false;
+
+/**
+ * Check if Cortex API is reachable. Call on startup.
+ */
+export async function checkCortexHealth(): Promise<boolean> {
+  try {
+    const response = await fetch(`${CORTEX_URL}/api/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "health check", collection: "rules", limit: 1 }),
+      signal: AbortSignal.timeout(5000),
+    });
+    cortexHealthy = response.ok;
+    console.log(`[CORTEX] Health: ${cortexHealthy ? "OK" : "FAILED"} (${CORTEX_URL})`);
+    return cortexHealthy;
+  } catch (error) {
+    cortexHealthy = false;
+    console.error(`[CORTEX] Unreachable: ${error}`);
+    return false;
+  }
+}
+
+/**
+ * Auto-save important exchanges to Cortex.
+ * Detects: decisions, procedures, bug fixes, setup steps, architecture choices.
+ * Called after every assistant response.
+ */
+export async function autoSaveToCortex(
+  userMessage: string,
+  assistantResponse: string
+): Promise<void> {
+  if (!cortexHealthy) return;
+
+  const combined = (userMessage + " " + assistantResponse).toLowerCase();
+
+  // Detection keywords (per MEM-H-002 aggressive mode)
+  const isDecision = /decided|decision|we('ll| will) (use|go with|choose)|approved|rejected|agreed/i.test(combined);
+  const isProcedure = /step 1|step 2|first.*then.*finally|install|configure|deploy|setup/i.test(combined) && combined.length > 300;
+  const isBugFix = /fix(ed)?|bug|error|solved|workaround|the (issue|problem) was/i.test(combined);
+  const isArchitecture = /architect|design|we('ll| will) build|stack|infrastructure|migration/i.test(combined);
+
+  if (!isDecision && !isProcedure && !isBugFix && !isArchitecture) return;
+
+  const type = isDecision ? "decision" : isBugFix ? "bug-fix" : isProcedure ? "procedure" : "architecture";
+
+  // Truncate to avoid storing huge payloads
+  const summary = assistantResponse.length > 1000
+    ? assistantResponse.substring(0, 1000) + "..."
+    : assistantResponse;
+
+  try {
+    await storeInCortex(
+      `[${type}] Q: ${userMessage.substring(0, 200)}\n\nA: ${summary}`,
+      "procedures",
+      {
+        type: "auto-saved",
+        category: type,
+        source: "telegram-relay",
+        source_agent: "rich-coo",
+        timestamp: new Date().toISOString(),
+        tags: ["auto-save", type, "telegram"],
+      }
+    );
+    console.log(`[CORTEX] Auto-saved: ${type} (${userMessage.substring(0, 50)}...)`);
+  } catch (error) {
+    console.error(`[CORTEX] Auto-save failed:`, error);
+  }
+}
 
 interface CortexSearchResult {
   text: string;
