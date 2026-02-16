@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Genie Voice</title>
+  
+  <!-- PWA / Add to Home Screen -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Genie Voice">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1e293b">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icons/180x180.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="/icons/152x152.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="/icons/167x167.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="/icons/120x120.png">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+    }
+
+    .container {
+      background: rgba(30, 41, 59, 0.8);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 40px;
+      max-width: 600px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+      border: 1px solid rgba(148, 163, 184, 0.1);
+    }
+
+    h1 {
+      text-align: center;
+      margin-bottom: 10px;
+      font-size: 2em;
+      background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      text-align: center;
+      color: #94a3b8;
+      margin-bottom: 30px;
+      font-size: 0.9em;
+    }
+
+    .status {
+      padding: 15px;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      text-align: center;
+      font-weight: 500;
+      transition: all 0.3s ease;
+    }
+
+    .status.disconnected { background: #1e293b; color: #94a3b8; }
+    .status.connecting { background: #fef3c7; color: #92400e; }
+    .status.connected { background: #d1fae5; color: #065f46; }
+    .status.listening { background: #dbeafe; color: #1e40af; }
+    .status.thinking { background: #e9d5ff; color: #6b21a8; }
+    .status.speaking { background: #fce7f3; color: #9f1239; }
+    .status.error { background: #fee2e2; color: #991b1b; }
+
+    .controls {
+      display: flex;
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+
+    button {
+      flex: 1;
+      padding: 15px 30px;
+      font-size: 1.1em;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-start {
+      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+      color: white;
+    }
+
+    .btn-end {
+      background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+      color: white;
+    }
+
+    .volume-meter {
+      height: 8px;
+      background: #1e293b;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .volume-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #10b981 0%, #3b82f6 50%, #ef4444 100%);
+      width: 0%;
+      transition: width 0.05s ease;
+      border-radius: 4px;
+    }
+
+    .transcript {
+      background: #0f172a;
+      border-radius: 10px;
+      padding: 20px;
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+
+    .transcript::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .transcript::-webkit-scrollbar-track {
+      background: #1e293b;
+      border-radius: 4px;
+    }
+
+    .transcript::-webkit-scrollbar-thumb {
+      background: #475569;
+      border-radius: 4px;
+    }
+
+    .message {
+      margin-bottom: 15px;
+      padding: 12px 15px;
+      border-radius: 8px;
+      line-height: 1.5;
+    }
+
+    .message.user {
+      background: rgba(59, 130, 246, 0.2);
+      border-left: 3px solid #3b82f6;
+    }
+
+    .message.assistant {
+      background: rgba(167, 139, 250, 0.2);
+      border-left: 3px solid #a78bfa;
+    }
+
+    .message .role {
+      font-weight: 600;
+      margin-bottom: 5px;
+      font-size: 0.85em;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .message.user .role { color: #60a5fa; }
+    .message.assistant .role { color: #c4b5fd; }
+
+    .message .text {
+      color: #e2e8f0;
+    }
+
+    .empty-state {
+      text-align: center;
+      color: #64748b;
+      padding: 40px 20px;
+      font-style: italic;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .status.listening, .status.thinking {
+      animation: pulse 2s ease-in-out infinite;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎙️ Genie Voice Test</h1>
+    <div class="subtitle">Browser-based voice assistant testing</div>
+
+    <div id="status" class="status disconnected">
+      Deconectat
+    </div>
+
+    <div class="volume-meter">
+      <div id="volumeBar" class="volume-bar"></div>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn" class="btn-start">
+        Sună Genie
+      </button>
+      <button id="endBtn" class="btn-end" disabled>
+        Închide
+      </button>
+    </div>
+
+    <div class="transcript" id="transcript">
+      <div class="empty-state">
+        Apasă "Sună Genie" pentru a începe...
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Configuration
+    const WS_URL = (() => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      return `${protocol}//${host}/voice/test?key=__VOICE_WS_AUTH_KEY__`;
+    })();
+
+    const SAMPLE_RATE = 16000;
+    const CHUNK_SIZE = 1600; // 100ms at 16kHz
+    const AUTH_KEY = '__VOICE_WS_AUTH_KEY__';
+
+    // State
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let audioWorkletNode = null;
+    let volumeInterval = null;
+    let isConnected = false;
+    let isSpeaking = false;
+
+    // DOM elements
+    const statusEl = document.getElementById('status');
+    const volumeBarEl = document.getElementById('volumeBar');
+    const transcriptEl = document.getElementById('transcript');
+    const startBtn = document.getElementById('startBtn');
+    const endBtn = document.getElementById('endBtn');
+
+    // Update status display
+    function setStatus(status, text) {
+      statusEl.className = `status ${status}`;
+      statusEl.textContent = text;
+    }
+
+    // Add message to transcript
+    function addMessage(role, text) {
+      // Remove empty state
+      const emptyState = transcriptEl.querySelector('.empty-state');
+      if (emptyState) {
+        emptyState.remove();
+      }
+
+      const messageEl = document.createElement('div');
+      messageEl.className = `message ${role}`;
+      
+      const roleEl = document.createElement('div');
+      roleEl.className = 'role';
+      roleEl.textContent = role === 'user' ? 'Tu' : 'Genie';
+      
+      const textEl = document.createElement('div');
+      textEl.className = 'text';
+      textEl.textContent = text;
+      
+      messageEl.appendChild(roleEl);
+      messageEl.appendChild(textEl);
+      transcriptEl.appendChild(messageEl);
+      
+      // Auto scroll to bottom
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    // Update volume meter
+    function updateVolume(level) {
+      const percent = Math.min(100, level * 100);
+      volumeBarEl.style.width = `${percent}%`;
+    }
+
+    // AudioWorklet processor for capturing microphone
+    const audioWorkletCode = `
+      class AudioCaptureProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.buffer = [];
+          this.chunkSize = ${CHUNK_SIZE};
+        }
+
+        process(inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (!input || !input[0]) return true;
+
+          const samples = input[0];
+          
+          // Convert Float32 to Int16 PCM
+          const pcm16 = new Int16Array(samples.length);
+          for (let i = 0; i < samples.length; i++) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+
+          this.buffer.push(...pcm16);
+
+          // Send chunks when we have enough samples
+          while (this.buffer.length >= this.chunkSize) {
+            const chunk = this.buffer.splice(0, this.chunkSize);
+            this.port.postMessage({
+              type: 'audio',
+              data: new Int16Array(chunk)
+            });
+          }
+
+          // Calculate volume for visualization
+          const rms = Math.sqrt(samples.reduce((sum, s) => sum + s * s, 0) / samples.length);
+          this.port.postMessage({
+            type: 'volume',
+            level: rms
+          });
+
+          return true;
+        }
+      }
+
+      registerProcessor('audio-capture-processor', AudioCaptureProcessor);
+    `;
+
+    // Start audio capture and WebSocket connection
+    async function startCall() {
+      try {
+        setStatus('connecting', 'Conectare...');
+        startBtn.disabled = true;
+
+        // Request microphone access
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: SAMPLE_RATE,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        });
+
+        // Create audio context
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+
+        // Create AudioWorklet
+        const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(workletBlob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-capture-processor');
+
+        // Handle audio chunks
+        audioWorkletNode.port.onmessage = (event) => {
+          if (event.data.type === 'audio') {
+            sendAudioChunk(event.data.data);
+          } else if (event.data.type === 'volume') {
+            updateVolume(event.data.level);
+          }
+        };
+
+        // Connect audio graph
+        source.connect(audioWorkletNode);
+
+        // Connect WebSocket
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          console.log('WebSocket connected');
+          isConnected = true;
+          setStatus('connected', 'Conectat - Vorbește acum');
+          endBtn.disabled = false;
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            const message = JSON.parse(event.data);
+
+            if (message.type === 'transcript') {
+              addMessage(message.role, message.text);
+            } else if (message.type === 'audio') {
+              await playAudio(message.data);
+            } else if (message.type === 'status') {
+              setStatus(message.status, message.text);
+            }
+          } catch (error) {
+            console.error('Error handling message:', error);
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          setStatus('error', 'Eroare de conexiune');
+        };
+
+        ws.onclose = () => {
+          console.log('WebSocket closed');
+          if (isConnected) {
+            endCall();
+          }
+        };
+
+      } catch (error) {
+        console.error('Error starting call:', error);
+        setStatus('error', `Eroare: ${error.message}`);
+        startBtn.disabled = false;
+      }
+    }
+
+    // Send audio chunk via WebSocket
+    function sendAudioChunk(pcm16Data) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || isSpeaking) return;
+
+      // Convert Int16Array to base64
+      const bytes = new Uint8Array(pcm16Data.buffer);
+      const base64 = btoa(String.fromCharCode(...bytes));
+
+      ws.send(JSON.stringify({
+        type: 'audio',
+        data: base64
+      }));
+    }
+
+    // Play audio response
+    async function playAudio(base64Audio) {
+      try {
+        isSpeaking = true;
+        setStatus('speaking', 'Genie vorbește...');
+
+        // Decode base64 to ArrayBuffer
+        const binaryString = atob(base64Audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // Create audio element and play
+        const blob = new Blob([bytes], { type: 'audio/ogg' });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+
+        audio.onended = () => {
+          isSpeaking = false;
+          URL.revokeObjectURL(url);
+          setStatus('listening', 'Ascult...');
+        };
+
+        audio.onerror = (error) => {
+          isSpeaking = false;
+          console.error('Audio playback error:', error);
+          URL.revokeObjectURL(url);
+          setStatus('listening', 'Ascult...');
+        };
+
+        await audio.play();
+
+      } catch (error) {
+        isSpeaking = false;
+        console.error('Error playing audio:', error);
+        setStatus('listening', 'Ascult...');
+      }
+    }
+
+    // End call and cleanup
+    function endCall() {
+      isConnected = false;
+
+      // Close WebSocket
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+
+      // Stop audio
+      if (audioWorkletNode) {
+        audioWorkletNode.disconnect();
+        audioWorkletNode = null;
+      }
+
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      // Reset UI
+      setStatus('disconnected', 'Deconectat');
+      updateVolume(0);
+      startBtn.disabled = false;
+      endBtn.disabled = true;
+    }
+
+    // Event listeners
+    startBtn.addEventListener('click', startCall);
+    endBtn.addEventListener('click', endCall);
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', endCall);
+
+    // Register service worker for PWA
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js', { scope: '/voice/' })
+        .then(reg => console.log('SW registered'))
+        .catch(err => console.log('SW failed:', err));
+    }
+  </script>
+</body>
+</html>

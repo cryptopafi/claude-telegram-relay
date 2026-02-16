@@ -5,7 +5,7 @@
  * Bidirectional sync: READ (rules, procedures, context) + WRITE (decisions, procedures, conversations).
  */
 
-const CORTEX_URL = process.env.CORTEX_URL || "http://100.81.233.9:6400";
+const CORTEX_URL = process.env.CORTEX_URL || "http://localhost:6400";
 const CORTEX_API_KEY = process.env.CORTEX_API_KEY || "";
 
 let cortexHealthy = false;
@@ -450,4 +450,58 @@ export async function processProcedureTags(response: string): Promise<string> {
   }
 
   return clean.trim();
+}
+
+/**
+ * List rules from Cortex by level (hard/standard/soft/temporary)
+ */
+export async function listRulesFromCortex(level?: string): Promise<string> {
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (CORTEX_API_KEY) {
+      headers.Authorization = `Bearer ${CORTEX_API_KEY}`;
+    }
+
+    const params = new URLSearchParams({ limit: "50" });
+    if (level) params.set("level", level);
+
+    const response = await fetch(`${CORTEX_URL}/api/list/rules?${params}`, {
+      method: "GET",
+      headers,
+    });
+
+    if (!response.ok) {
+      return `Eroare la citirea regulilor: ${response.status}`;
+    }
+
+    const data = await response.json();
+    const docs = data.documents || [];
+
+    if (docs.length === 0) {
+      return level ? `Nu am găsit reguli ${level.toUpperCase()}.` : "Nu am găsit reguli în Cortex.";
+    }
+
+    // Sort by rule_id
+    docs.sort((a: any, b: any) => {
+      const idA = a.payload?.rule_id || "";
+      const idB = b.payload?.rule_id || "";
+      return idA.localeCompare(idB);
+    });
+
+    const header = level ? `Reguli ${level.toUpperCase()} (${docs.length}):` : `Toate regulile (${docs.length}):`;
+    const lines = docs.map((d: any) => {
+      const p = d.payload;
+      const ruleId = p.rule_id || "???";
+      const text = (p.text || "").split("\n")[0].replace(ruleId + ": ", "");
+      return `• ${ruleId} — ${text}`;
+    });
+
+    return header + "\n\n" + lines.join("\n");
+  } catch (error) {
+    console.error("Cortex list rules error:", error);
+    return "Eroare la conectarea cu Cortex.";
+  }
 }

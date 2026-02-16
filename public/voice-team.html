@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Genie Voice</title>
+  
+  <!-- PWA / Add to Home Screen -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="OpenClaw">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="/manifest-team.json">
+  <link rel="apple-touch-icon" href="/icons/180x180.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="/icons/152x152.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="/icons/167x167.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="/icons/120x120.png">
+
+  <style>
+    :root {
+      --bg: #000000;
+      --card: rgba(28, 28, 30, 0.8);
+      --card-solid: #1c1c1e;
+      --card-hover: rgba(44, 44, 46, 0.9);
+      --text: #f5f5f7;
+      --text-secondary: #86868b;
+      --accent: #0a84ff;
+      --green: #30d158;
+      --red: #ff453a;
+      --orange: #ff9f0a;
+      --purple: #bf5af2;
+      --teal: #64d2ff;
+      --separator: rgba(84, 84, 88, 0.35);
+      --glass: rgba(28, 28, 30, 0.72);
+      --radius: 16px;
+      --radius-sm: 12px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      overflow-x: hidden;
+    }
+
+    /* Header */
+    .header {
+      padding: 16px 20px 8px;
+      text-align: center;
+    }
+    .header h1 {
+      font-size: 34px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #f5f5f7 0%, #86868b 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .header p {
+      color: var(--text-secondary);
+      font-size: 15px;
+      margin-top: 4px;
+      font-weight: 400;
+    }
+
+    /* Agent Grid */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      padding: 16px 20px;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    .agent-card {
+      background: var(--card);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--separator);
+      border-radius: var(--radius);
+      padding: 20px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.25s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      position: relative;
+      overflow: hidden;
+    }
+    .agent-card:hover { background: var(--card-hover); transform: scale(1.02); }
+    .agent-card:active { transform: scale(0.97); }
+    .agent-card.calling {
+      border-color: var(--green);
+      box-shadow: 0 0 20px rgba(48, 209, 88, 0.15);
+    }
+    .agent-card.disabled {
+      opacity: 0.4;
+      pointer-events: none;
+    }
+
+    .agent-avatar {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      margin: 0 auto 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      font-weight: 600;
+      color: #fff;
+      position: relative;
+    }
+    .agent-avatar::after {
+      content: '';
+      position: absolute;
+      bottom: 2px;
+      right: 2px;
+      width: 12px;
+      height: 12px;
+      background: var(--green);
+      border-radius: 50%;
+      border: 2px solid var(--card-solid);
+    }
+
+    .agent-name {
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.2px;
+      margin-bottom: 2px;
+    }
+    .agent-role {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    /* Agent colors */
+    .agent-rich .agent-avatar { background: linear-gradient(135deg, #0a84ff, #0066cc); }
+    .agent-sage .agent-avatar { background: linear-gradient(135deg, #30d158, #248a3d); }
+    .agent-scottie .agent-avatar { background: linear-gradient(135deg, #ff9f0a, #c77800); }
+    .agent-mark .agent-avatar { background: linear-gradient(135deg, #bf5af2, #8944ab); }
+    .agent-ressie .agent-avatar { background: linear-gradient(135deg, #64d2ff, #0091d4); }
+
+    /* Call Screen (hidden by default) */
+    .call-screen {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: var(--bg);
+      z-index: 100;
+      flex-direction: column;
+      padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 20px);
+    }
+    .call-screen.active { display: flex; }
+
+    .call-header {
+      text-align: center;
+      padding: 40px 0 20px;
+      flex-shrink: 0;
+    }
+    .call-avatar {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      margin: 0 auto 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 40px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .call-name {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    .call-status {
+      font-size: 15px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      min-height: 22px;
+    }
+    .call-status.listening { color: var(--green); }
+    .call-status.thinking { color: var(--purple); }
+    .call-status.speaking { color: var(--orange); }
+
+    /* Volume indicator */
+    .volume-ring {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      border: 2px solid rgba(10, 132, 255, 0.3);
+      transition: all 0.1s ease;
+      pointer-events: none;
+    }
+    .call-avatar-wrapper {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      margin: 0 auto 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Transcript */
+    .transcript-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 0;
+      -webkit-overflow-scrolling: touch;
+    }
+    .transcript-area::-webkit-scrollbar { display: none; }
+
+    .message {
+      margin-bottom: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message-bubble {
+      max-width: 80%;
+      padding: 10px 14px;
+      border-radius: 18px;
+      font-size: 15px;
+      line-height: 1.4;
+    }
+    .message.user { justify-content: flex-end; }
+    .message.user .message-bubble {
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .message.assistant .message-bubble {
+      background: var(--card);
+      border: 1px solid var(--separator);
+      border-bottom-left-radius: 4px;
+    }
+
+    .empty-transcript {
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 15px;
+      padding: 60px 20px;
+    }
+
+    /* Call Controls */
+    .call-controls {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      padding: 24px 0;
+      flex-shrink: 0;
+    }
+
+    .call-btn {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      font-size: 24px;
+    }
+    .call-btn:active { transform: scale(0.9); }
+
+    .btn-mute {
+      background: rgba(84, 84, 88, 0.5);
+      color: var(--text);
+    }
+    .btn-mute.muted { background: #fff; color: #000; }
+
+    .btn-end {
+      background: var(--red);
+      color: #fff;
+      width: 72px;
+      height: 72px;
+      font-size: 28px;
+    }
+
+    .btn-transfer {
+      background: rgba(84, 84, 88, 0.5);
+      color: var(--text);
+    }
+
+    /* Pulse animation for active call */
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.4); }
+      70% { box-shadow: 0 0 0 15px rgba(48, 209, 88, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(48, 209, 88, 0); }
+    }
+    .call-avatar.active {
+      animation: pulse-ring 2s ease infinite;
+    }
+
+    /* Connecting animation */
+    @keyframes connecting-dots {
+      0%, 20% { opacity: 0; }
+      50% { opacity: 1; }
+      80%, 100% { opacity: 0; }
+    }
+    .connecting-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+      margin: 0 2px;
+    }
+    .connecting-dot:nth-child(1) { animation: connecting-dots 1.4s infinite 0s; }
+    .connecting-dot:nth-child(2) { animation: connecting-dots 1.4s infinite 0.2s; }
+    .connecting-dot:nth-child(3) { animation: connecting-dots 1.4s infinite 0.4s; }
+  </style>
+</head>
+<body>
+
+  <!-- Main Screen: Agent Grid -->
+  <div id="mainScreen">
+    <div class="header">
+      <h1>OpenClaw</h1>
+      <p>Voice Team</p>
+    </div>
+
+    <div class="agent-grid">
+      <div class="agent-card agent-rich" onclick="startCall('rich')">
+        <div class="agent-avatar">R</div>
+        <div class="agent-name">Rich</div>
+        <div class="agent-role">COO</div>
+      </div>
+
+      <div class="agent-card agent-sage" onclick="startCall('sage')">
+        <div class="agent-avatar">S</div>
+        <div class="agent-name">Sage</div>
+        <div class="agent-role">Strategy</div>
+      </div>
+
+      <div class="agent-card agent-scottie" onclick="startCall('scottie')">
+        <div class="agent-avatar">Sc</div>
+        <div class="agent-name">Scottie</div>
+        <div class="agent-role">Guests</div>
+      </div>
+
+      <div class="agent-card agent-mark" onclick="startCall('mark')">
+        <div class="agent-avatar">M</div>
+        <div class="agent-name">Mark</div>
+        <div class="agent-role">Marketing</div>
+      </div>
+
+      <div class="agent-card agent-ressie" onclick="startCall('ressie')">
+        <div class="agent-avatar">Re</div>
+        <div class="agent-name">Ressie</div>
+        <div class="agent-role">Research</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Call Screen -->
+  <div id="callScreen" class="call-screen">
+    <div class="call-header">
+      <div class="call-avatar-wrapper">
+        <div id="callAvatar" class="call-avatar">R</div>
+        <div id="volumeRing" class="volume-ring"></div>
+      </div>
+      <div id="callName" class="call-name">Rich</div>
+      <div id="callStatus" class="call-status">
+        Conectare<span class="connecting-dot"></span><span class="connecting-dot"></span><span class="connecting-dot"></span>
+      </div>
+    </div>
+
+    <div id="transcript" class="transcript-area">
+      <div class="empty-transcript">Conversația va apărea aici...</div>
+    </div>
+
+    <div class="call-controls">
+      <button class="call-btn btn-mute" id="muteBtn" onclick="toggleMute()">
+        <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </button>
+      <button class="call-btn btn-end" id="endBtn" onclick="endCall()">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.956.956 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28a11.27 11.27 0 0 0-2.67-1.85.996.996 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
+      </button>
+      <button class="call-btn btn-transfer" id="transferBtn" onclick="showTransfer()">
+        <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <script>
+    // Agent definitions
+    const AGENTS = {
+      rich:    { name: 'Rich',    role: 'COO',       color: 'linear-gradient(135deg, #0a84ff, #0066cc)', initial: 'R' },
+      sage:    { name: 'Sage',    role: 'Strategy',   color: 'linear-gradient(135deg, #30d158, #248a3d)', initial: 'S' },
+      scottie: { name: 'Scottie', role: 'Guests',     color: 'linear-gradient(135deg, #ff9f0a, #c77800)', initial: 'Sc' },
+      mark:    { name: 'Mark',    role: 'Marketing',  color: 'linear-gradient(135deg, #bf5af2, #8944ab)', initial: 'M' },
+      ressie:  { name: 'Ressie',  role: 'Research',   color: 'linear-gradient(135deg, #64d2ff, #0091d4)', initial: 'Re' },
+    };
+
+    // Config
+    const SAMPLE_RATE = 16000;
+    const CHUNK_SIZE = 1600;
+
+    // State
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let audioWorkletNode = null;
+    let isConnected = false;
+    let isSpeaking = false;
+    let isMuted = false;
+    let currentAgent = null;
+    let audioUnlocked = false;
+
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+      audioUnlocked = true;
+      console.log('Audio unlocked for iOS');
+    }
+
+    // DOM
+    const mainScreen = document.getElementById('mainScreen');
+    const callScreen = document.getElementById('callScreen');
+    const callAvatar = document.getElementById('callAvatar');
+    const callName = document.getElementById('callName');
+    const callStatus = document.getElementById('callStatus');
+    const transcript = document.getElementById('transcript');
+    const volumeRing = document.getElementById('volumeRing');
+    const muteBtn = document.getElementById('muteBtn');
+
+    function getWsUrl(agentId) {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      return `${protocol}//${host}/voice/test?key=__VOICE_WS_AUTH_KEY__&agent=${agentId}`;
+    }
+
+    function setCallStatus(status, text) {
+      callStatus.className = 'call-status ' + status;
+      if (status === 'connecting') {
+        callStatus.innerHTML = text + '<span class="connecting-dot"></span><span class="connecting-dot"></span><span class="connecting-dot"></span>';
+      } else {
+        callStatus.textContent = text;
+      }
+    }
+
+    function addMessage(role, text) {
+      const empty = transcript.querySelector('.empty-transcript');
+      if (empty) empty.remove();
+
+      const msgEl = document.createElement('div');
+      msgEl.className = `message ${role}`;
+
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
+      bubble.textContent = text;
+
+      msgEl.appendChild(bubble);
+      transcript.appendChild(msgEl);
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+
+    function updateVolume(level) {
+      const scale = 1 + (level * 0.8);
+      const opacity = Math.min(0.6, level * 2);
+      volumeRing.style.transform = `translate(-50%, -50%) scale(${scale})`;
+      volumeRing.style.borderColor = `rgba(10, 132, 255, ${opacity})`;
+    }
+
+    // AudioWorklet
+    const audioWorkletCode = `
+      class AudioCaptureProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.buffer = [];
+          this.chunkSize = ${CHUNK_SIZE};
+        }
+        process(inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (!input || !input[0]) return true;
+          const samples = input[0];
+          const pcm16 = new Int16Array(samples.length);
+          for (let i = 0; i < samples.length; i++) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          this.buffer.push(...pcm16);
+          while (this.buffer.length >= this.chunkSize) {
+            const chunk = this.buffer.splice(0, this.chunkSize);
+            this.port.postMessage({ type: 'audio', data: new Int16Array(chunk) });
+          }
+          const rms = Math.sqrt(samples.reduce((sum, s) => sum + s * s, 0) / samples.length);
+          this.port.postMessage({ type: 'volume', level: rms });
+          return true;
+        }
+      }
+      registerProcessor('audio-capture-processor', AudioCaptureProcessor);
+    `;
+
+    async function startCall(agentId) {
+      if (isConnected) return;
+      unlockAudio();
+      currentAgent = agentId;
+      const agent = AGENTS[agentId];
+
+      // Update call screen
+      callAvatar.textContent = agent.initial;
+      callAvatar.style.background = agent.color;
+      callName.textContent = agent.name;
+      setCallStatus('connecting', 'Conectare');
+
+      // Show call screen
+      mainScreen.style.display = 'none';
+      callScreen.classList.add('active');
+
+      // Clear transcript
+      transcript.innerHTML = '<div class="empty-transcript">Conversația va apărea aici...</div>';
+
+      // Highlight card
+      document.querySelectorAll('.agent-card').forEach(c => {
+        c.classList.remove('calling');
+        if (!c.classList.contains(`agent-${agentId}`)) c.classList.add('disabled');
+      });
+      document.querySelector(`.agent-${agentId}`)?.classList.add('calling');
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+
+        const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(workletBlob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-capture-processor');
+        audioWorkletNode.port.onmessage = (event) => {
+          if (event.data.type === 'audio') sendAudioChunk(event.data.data);
+          else if (event.data.type === 'volume') updateVolume(event.data.level);
+        };
+        source.connect(audioWorkletNode);
+
+        ws = new WebSocket(getWsUrl(agentId));
+
+        ws.onopen = () => {
+          isConnected = true;
+          callAvatar.classList.add('active');
+          setCallStatus('listening', 'Ascult...');
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === 'transcript') addMessage(message.role, message.text);
+            else if (message.type === 'audio') await playAudio(message.data);
+            else if (message.type === 'status') {
+              setCallStatus(message.status, message.text);
+            }
+          } catch (error) { console.error('Message error:', error); }
+        };
+
+        ws.onerror = () => setCallStatus('error', 'Eroare conexiune');
+        ws.onclose = () => { if (isConnected) endCall(); };
+
+      } catch (error) {
+        console.error('Start error:', error);
+        setCallStatus('error', error.message);
+        setTimeout(endCall, 2000);
+      }
+    }
+
+    function sendAudioChunk(pcm16Data) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || isSpeaking || isMuted) return;
+      const bytes = new Uint8Array(pcm16Data.buffer);
+      const base64 = btoa(String.fromCharCode(...bytes));
+      ws.send(JSON.stringify({ type: 'audio', data: base64 }));
+    }
+
+    async function playAudio(base64Audio) {
+      try {
+        isSpeaking = true;
+        setCallStatus("speaking", (AGENTS[currentAgent] ? AGENTS[currentAgent].name : "Agent") + " vorbeste...");
+        const binaryString = atob(base64Audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+        if (!audioContext || audioContext.state === "closed") {
+          isSpeaking = false; setCallStatus("listening", "Ascult..."); return;
+        }
+        if (audioContext.state === "suspended") await audioContext.resume();
+        const audioBuffer = await audioContext.decodeAudioData(bytes.buffer.slice(0));
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.onended = () => { isSpeaking = false; setCallStatus("listening", "Ascult..."); };
+        source.start(0);
+        console.log("Playing via Web Audio API:", audioBuffer.duration.toFixed(1), "s");
+      } catch (error) {
+        console.error("playAudio error:", error.name, error.message);
+        isSpeaking = false;
+        setCallStatus("listening", "Ascult...");
+      }
+    }
+
+    function endCall() {
+      isConnected = false;
+      isSpeaking = false;
+      currentAgent = null;
+
+      if (ws) { ws.close(); ws = null; }
+      if (audioWorkletNode) { audioWorkletNode.disconnect(); audioWorkletNode = null; }
+      if (audioContext) { audioContext.close(); audioContext = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+
+      callAvatar.classList.remove('active');
+
+      // Reset cards
+      document.querySelectorAll('.agent-card').forEach(c => {
+        c.classList.remove('calling', 'disabled');
+      });
+
+      // Switch screens
+      callScreen.classList.remove('active');
+      mainScreen.style.display = '';
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      muteBtn.classList.toggle('muted', isMuted);
+      if (mediaStream) {
+        mediaStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+      }
+    }
+
+    function showTransfer() {
+      // TODO: Show agent picker overlay for call transfer
+      alert('Transfer - coming soon');
+    }
+
+    // Cleanup
+    window.addEventListener('beforeunload', endCall);
+
+    // Register service worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js', { scope: '/voice/' })
+        .then(() => console.log('SW registered'))
+        .catch(err => console.log('SW failed:', err));
+    }
+  </script>
+</body>
+</html>

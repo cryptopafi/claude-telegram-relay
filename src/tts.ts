@@ -1,18 +1,20 @@
 /**
- * Text-to-Speech module using Microsoft Edge TTS (free, no API key)
- * Supports Romanian (ro-RO) and English (en-US) voices
+ * Text-to-Speech module using Google Cloud TTS (Chirp3-HD voices)
+ * Supports Romanian (ro-RO) and English (en-US)
+ * Free tier: 1M chars/month (WaveNet/Chirp3-HD)
  */
 
-import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
-import { unlink, mkdir } from "fs/promises";
+import { writeFile, unlink, mkdir } from "fs/promises";
 import { join } from "path";
 
+const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || "";
+const GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize";
 const TEMP_DIR = join(process.env.HOME || "~", ".claude-relay/tts");
 
-// Voice selection based on language detection
+// Chirp3-HD voices (highest quality, same name works for both languages)
 const VOICES = {
-  ro: "ro-RO-EmilNeural",    // Romanian male
-  en: "en-US-GuyNeural",     // English male
+  ro: { name: "ro-RO-Chirp3-HD-Aoede", languageCode: "ro-RO" },
+  en: { name: "en-US-Chirp3-HD-Aoede", languageCode: "en-US" },
 };
 
 // Simple Romanian detection
@@ -39,33 +41,64 @@ function cleanForTTS(text: string): string {
 }
 
 /**
- * Convert text to speech and return the file path
+ * Convert text to speech using Google Cloud TTS and return the file path
  */
 export async function textToSpeech(text: string): Promise<string | null> {
+  if (!GOOGLE_TTS_API_KEY) {
+    console.error("GOOGLE_TTS_API_KEY not set");
+    return null;
+  }
+
   try {
     const cleanText = cleanForTTS(text);
 
     // Skip TTS for very short or empty text
     if (cleanText.length < 3) return null;
 
-    // Truncate very long responses
+    // Truncate very long responses (save API quota)
     const truncated = cleanText.length > 3000
       ? cleanText.substring(0, 3000) + "... restul în text."
       : cleanText;
 
-    // Each call gets its own temp directory (toFile creates audio.mp3 inside it)
+    const lang = detectLanguage(text);
+    const voice = VOICES[lang];
+
+    const response = await fetch(`${GOOGLE_TTS_URL}?key=${GOOGLE_TTS_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: { text: truncated },
+        voice: {
+          languageCode: voice.languageCode,
+          name: voice.name,
+        },
+        audioConfig: {
+          audioEncoding: "OGG_OPUS",
+          sampleRateHertz: 24000,
+          speakingRate: 1.0,
+          pitch: 0.0,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      console.error("Google TTS error:", response.status, err);
+      return null;
+    }
+
+    const data = await response.json() as { audioContent: string };
+
+    // Decode base64 audio and save to file
+    const audioBuffer = Buffer.from(data.audioContent, "base64");
     const timestamp = Date.now();
     const outDir = join(TEMP_DIR, `${timestamp}`);
     await mkdir(outDir, { recursive: true });
 
-    const lang = detectLanguage(text);
-    const voice = VOICES[lang];
+    const audioPath = join(outDir, "audio.ogg");
+    await writeFile(audioPath, audioBuffer);
 
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-
-    const result = await tts.toFile(outDir, truncated);
-    return result.audioFilePath;
+    return audioPath;
   } catch (error) {
     console.error("TTS error:", error);
     return null;
@@ -78,7 +111,6 @@ export async function textToSpeech(text: string): Promise<string | null> {
 export async function cleanupTTS(filePath: string): Promise<void> {
   try {
     await unlink(filePath);
-    // Also remove the temp directory
     const dir = filePath.substring(0, filePath.lastIndexOf("/"));
     const { rmdir } = await import("fs/promises");
     await rmdir(dir).catch(() => {});

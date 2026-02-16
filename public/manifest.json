@@ -1,0 +1,23 @@
+{
+  "name": "Genie Voice - OpenClaw",
+  "short_name": "Genie Voice",
+  "description": "Voice assistant for OpenClaw team",
+  "start_url": "/voice/test-client",
+  "scope": "/voice/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f172a",
+  "theme_color": "#1e293b",
+  "icons": [
+    {
+      "src": "/icons/192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

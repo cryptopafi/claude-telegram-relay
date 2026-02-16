@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Genie Voice</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Genie">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="/manifest-genie.json">
+  <link rel="apple-touch-icon" href="/icons/180x180.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="/icons/152x152.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="/icons/167x167.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="/icons/120x120.png">
+  <style>
+    :root {
+      --bg: #000000;
+      --card: rgba(28, 28, 30, 0.8);
+      --text: #f5f5f7;
+      --text-secondary: #86868b;
+      --accent: #0a84ff;
+      --green: #30d158;
+      --red: #ff453a;
+      --orange: #ff9f0a;
+      --purple: #bf5af2;
+      --separator: rgba(84, 84, 88, 0.35);
+      --radius: 16px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+
+    /* Idle Screen */
+    .idle-screen {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+    .idle-screen.hidden { display: none; }
+
+    .genie-avatar {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #0a84ff 0%, #5e5ce6 50%, #bf5af2 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 48px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 24px;
+      box-shadow: 0 0 40px rgba(10, 132, 255, 0.3);
+    }
+
+    .genie-title {
+      font-size: 34px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      margin-bottom: 8px;
+    }
+    .genie-subtitle {
+      font-size: 17px;
+      color: var(--text-secondary);
+      margin-bottom: 48px;
+    }
+
+    .call-button {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      border: none;
+      background: var(--green);
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 20px rgba(48, 209, 88, 0.4);
+    }
+    .call-button:hover { transform: scale(1.05); box-shadow: 0 6px 30px rgba(48, 209, 88, 0.5); }
+    .call-button:active { transform: scale(0.95); }
+    .call-button svg { width: 36px; height: 36px; }
+
+    .call-hint {
+      margin-top: 16px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    /* Call Screen */
+    .call-screen {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      padding: 20px;
+    }
+    .call-screen.active { display: flex; }
+
+    .call-header {
+      text-align: center;
+      padding: 40px 0 20px;
+      flex-shrink: 0;
+    }
+    .call-avatar-wrapper {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      margin: 0 auto 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .call-avatar {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #0a84ff 0%, #5e5ce6 50%, #bf5af2 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 40px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .volume-ring {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      border: 2px solid rgba(10, 132, 255, 0.3);
+      transition: all 0.1s ease;
+      pointer-events: none;
+    }
+    .call-name {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    .call-status {
+      font-size: 15px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      min-height: 22px;
+    }
+    .call-status.listening { color: var(--green); }
+    .call-status.thinking { color: var(--purple); }
+    .call-status.speaking { color: var(--orange); }
+
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(10, 132, 255, 0.4); }
+      70% { box-shadow: 0 0 0 15px rgba(10, 132, 255, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(10, 132, 255, 0); }
+    }
+    .call-avatar.active { animation: pulse-ring 2s ease infinite; }
+
+    @keyframes connecting-dots {
+      0%, 20% { opacity: 0; }
+      50% { opacity: 1; }
+      80%, 100% { opacity: 0; }
+    }
+    .connecting-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+      margin: 0 2px;
+    }
+    .connecting-dot:nth-child(1) { animation: connecting-dots 1.4s infinite 0s; }
+    .connecting-dot:nth-child(2) { animation: connecting-dots 1.4s infinite 0.2s; }
+    .connecting-dot:nth-child(3) { animation: connecting-dots 1.4s infinite 0.4s; }
+
+    /* Transcript */
+    .transcript-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 0;
+      -webkit-overflow-scrolling: touch;
+    }
+    .transcript-area::-webkit-scrollbar { display: none; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .message {
+      margin-bottom: 12px;
+      display: flex;
+      animation: fadeIn 0.3s ease;
+    }
+    .message-bubble {
+      max-width: 80%;
+      padding: 10px 14px;
+      border-radius: 18px;
+      font-size: 15px;
+      line-height: 1.4;
+    }
+    .message.user { justify-content: flex-end; }
+    .message.user .message-bubble {
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .message.assistant .message-bubble {
+      background: var(--card);
+      border: 1px solid var(--separator);
+      border-bottom-left-radius: 4px;
+    }
+    .empty-transcript {
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 15px;
+      padding: 60px 20px;
+    }
+
+    /* Controls */
+    .call-controls {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      padding: 24px 0;
+      flex-shrink: 0;
+    }
+    .call-btn {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      font-size: 24px;
+    }
+    .call-btn:active { transform: scale(0.9); }
+    .btn-mute { background: rgba(84, 84, 88, 0.5); color: var(--text); }
+    .btn-mute.muted { background: #fff; color: #000; }
+    .btn-end { background: var(--red); color: #fff; width: 72px; height: 72px; font-size: 28px; }
+  </style>
+</head>
+<body>
+
+  <!-- Idle Screen -->
+  <div id="idleScreen" class="idle-screen">
+    <div class="genie-avatar">G</div>
+    <div class="genie-title">Genie</div>
+    <div class="genie-subtitle">Personal Voice Assistant</div>
+    <button class="call-button" onclick="startCall()">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.01 15.38c-1.23 0-2.42-.2-3.53-.56a.977.977 0 0 0-1.01.24l-1.57 1.97c-2.83-1.35-5.48-3.9-6.89-6.83l1.95-1.66c.27-.28.35-.67.24-1.02-.37-1.11-.56-2.3-.56-3.53 0-.54-.45-.99-.99-.99H4.19C3.65 3 3 3.24 3 3.99 3 13.28 10.73 21 20.01 21c.71 0 .99-.63.99-1.18v-3.45c0-.54-.45-.99-.99-.99z"/></svg>
+    </button>
+    <div class="call-hint">Apasa pentru a suna</div>
+  </div>
+
+  <!-- Call Screen -->
+  <div id="callScreen" class="call-screen">
+    <div class="call-header">
+      <div class="call-avatar-wrapper">
+        <div id="callAvatar" class="call-avatar">G</div>
+        <div id="volumeRing" class="volume-ring"></div>
+      </div>
+      <div class="call-name">Genie</div>
+      <div id="callStatus" class="call-status">
+        Conectare<span class="connecting-dot"></span><span class="connecting-dot"></span><span class="connecting-dot"></span>
+      </div>
+    </div>
+
+    <div id="transcript" class="transcript-area">
+      <div class="empty-transcript">Conversatia va aparea aici...</div>
+    </div>
+
+    <div class="call-controls">
+      <button class="call-btn btn-mute" id="muteBtn" onclick="toggleMute()">
+        <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </button>
+      <button class="call-btn btn-end" onclick="endCall()">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.956.956 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28a11.27 11.27 0 0 0-2.67-1.85.996.996 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <script>
+    const SAMPLE_RATE = 16000;
+    const CHUNK_SIZE = 1600;
+
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let audioWorkletNode = null;
+    let isConnected = false;
+    let isSpeaking = false;
+    let isMuted = false;
+    let audioUnlocked = false;
+    let audioQueue = [];
+
+    // iOS requires audio to be "unlocked" by a user gesture
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+      audioUnlocked = true;
+      console.log('Audio unlocked for iOS');
+    }
+
+    const idleScreen = document.getElementById('idleScreen');
+    const callScreen = document.getElementById('callScreen');
+    const callAvatar = document.getElementById('callAvatar');
+    const callStatus = document.getElementById('callStatus');
+    const transcript = document.getElementById('transcript');
+    const volumeRing = document.getElementById('volumeRing');
+    const muteBtn = document.getElementById('muteBtn');
+
+    function getWsUrl() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      return protocol + '//' + host + '/voice/test?key=__VOICE_WS_AUTH_KEY__&agent=genie';
+    }
+
+    function setCallStatus(status, text) {
+      callStatus.className = 'call-status ' + status;
+      if (status === 'connecting') {
+        callStatus.innerHTML = text + '<span class="connecting-dot"></span><span class="connecting-dot"></span><span class="connecting-dot"></span>';
+      } else {
+        callStatus.textContent = text;
+      }
+    }
+
+    function addMessage(role, text) {
+      const empty = transcript.querySelector('.empty-transcript');
+      if (empty) empty.remove();
+      const msgEl = document.createElement('div');
+      msgEl.className = 'message ' + role;
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
+      bubble.textContent = text;
+      msgEl.appendChild(bubble);
+      transcript.appendChild(msgEl);
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+
+    function updateVolume(level) {
+      const scale = 1 + (level * 0.8);
+      const opacity = Math.min(0.6, level * 2);
+      volumeRing.style.transform = 'translate(-50%, -50%) scale(' + scale + ')';
+      volumeRing.style.borderColor = 'rgba(10, 132, 255, ' + opacity + ')';
+    }
+
+    const audioWorkletCode = '\
+      class AudioCaptureProcessor extends AudioWorkletProcessor {\n\
+        constructor() { super(); this.buffer = []; this.chunkSize = ' + CHUNK_SIZE + '; }\n\
+        process(inputs, outputs, parameters) {\n\
+          const input = inputs[0];\n\
+          if (!input || !input[0]) return true;\n\
+          const samples = input[0];\n\
+          const pcm16 = new Int16Array(samples.length);\n\
+          for (let i = 0; i < samples.length; i++) {\n\
+            const s = Math.max(-1, Math.min(1, samples[i]));\n\
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;\n\
+          }\n\
+          this.buffer.push(...pcm16);\n\
+          while (this.buffer.length >= this.chunkSize) {\n\
+            const chunk = this.buffer.splice(0, this.chunkSize);\n\
+            this.port.postMessage({ type: "audio", data: new Int16Array(chunk) });\n\
+          }\n\
+          const rms = Math.sqrt(samples.reduce((sum, s) => sum + s * s, 0) / samples.length);\n\
+          this.port.postMessage({ type: "volume", level: rms });\n\
+          return true;\n\
+        }\n\
+      }\n\
+      registerProcessor("audio-capture-processor", AudioCaptureProcessor);\n\
+    ';
+
+    async function startCall() {
+      if (isConnected) return;
+      unlockAudio();
+      setCallStatus('connecting', 'Conectare');
+      idleScreen.classList.add('hidden');
+      callScreen.classList.add('active');
+      transcript.innerHTML = '<div class="empty-transcript">Conversatia va aparea aici...</div>';
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(workletBlob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-capture-processor');
+        audioWorkletNode.port.onmessage = (event) => {
+          if (event.data.type === 'audio') sendAudioChunk(event.data.data);
+          else if (event.data.type === 'volume') updateVolume(event.data.level);
+        };
+        source.connect(audioWorkletNode);
+
+        ws = new WebSocket(getWsUrl());
+        ws.onopen = () => {
+          isConnected = true;
+          callAvatar.classList.add('active');
+          setCallStatus('listening', 'Ascult...');
+        };
+        ws.onmessage = async (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === 'transcript') addMessage(message.role, message.text);
+            else if (message.type === 'audio') await playAudio(message.data);
+            else if (message.type === 'status') setCallStatus(message.status, message.text);
+          } catch (error) { console.error('Message error:', error); }
+        };
+        ws.onerror = () => setCallStatus('error', 'Eroare conexiune');
+        ws.onclose = () => { if (isConnected) endCall(); };
+      } catch (error) {
+        console.error('Start error:', error);
+        setCallStatus('error', error.message);
+        setTimeout(endCall, 2000);
+      }
+    }
+
+    function sendAudioChunk(pcm16Data) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || isSpeaking || isMuted) return;
+      const bytes = new Uint8Array(pcm16Data.buffer);
+      const base64 = btoa(String.fromCharCode(...bytes));
+      ws.send(JSON.stringify({ type: 'audio', data: base64 }));
+    }
+
+    async function playAudio(base64Audio) {
+      try {
+        isSpeaking = true;
+        setCallStatus("speaking", "Genie vorbeste...");
+        const binaryString = atob(base64Audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+        if (!audioContext || audioContext.state === "closed") {
+          isSpeaking = false; setCallStatus("listening", "Ascult..."); return;
+        }
+        if (audioContext.state === "suspended") await audioContext.resume();
+        const audioBuffer = await audioContext.decodeAudioData(bytes.buffer.slice(0));
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.onended = () => { isSpeaking = false; setCallStatus("listening", "Ascult..."); };
+        source.start(0);
+        console.log("Playing via Web Audio API:", audioBuffer.duration.toFixed(1), "s");
+      } catch (error) {
+        console.error("playAudio error:", error.name, error.message);
+        isSpeaking = false;
+        setCallStatus("listening", "Ascult...");
+      }
+    }
+
+    function endCall() {
+      isConnected = false;
+      isSpeaking = false;
+      if (ws) { ws.close(); ws = null; }
+      if (audioWorkletNode) { audioWorkletNode.disconnect(); audioWorkletNode = null; }
+      if (audioContext) { audioContext.close(); audioContext = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      callAvatar.classList.remove('active');
+      callScreen.classList.remove('active');
+      idleScreen.classList.remove('hidden');
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      muteBtn.classList.toggle('muted', isMuted);
+      if (mediaStream) mediaStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+    }
+
+    window.addEventListener('beforeunload', endCall);
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js', { scope: '/voice/' })
+        .then(() => console.log('SW registered'))
+        .catch(err => console.log('SW failed:', err));
+    }
+  </script>
+</body>
+</html>

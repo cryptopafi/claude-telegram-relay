@@ -14,13 +14,13 @@
     "setup:verify": "bun run setup/verify.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
     "@mozilla/readability": "^0.6.0",
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^17.3.1",
     "grammy": "^1.21.1",
-    "groq-sdk": "^0.8.0",
+    "groq-sdk": "^0.37.0",
     "linkedom": "^0.18.12",
-    "msedge-tts": "^2.0.4",
     "otpauth": "^9.5.0",
     "youtube-caption-extractor": "^1.9.1"
   },

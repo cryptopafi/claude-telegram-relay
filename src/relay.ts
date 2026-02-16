@@ -30,6 +30,7 @@ import {
   processProcedureTags,
   checkCortexHealth,
   autoSaveToCortex,
+  listRulesFromCortex,
 } from "./cortex-client.ts";
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
 import { textToSpeech, cleanupTTS } from "./tts.ts";
@@ -49,7 +50,7 @@ const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 
 // Directories
-const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-Users-pafi/memory");
+const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-home-pafi/memory/memory");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
 
@@ -379,19 +380,23 @@ bot.command("totp_setup", async (ctx) => {
   await ctx.reply(setup.qrText);
 });
 
-// /rules command - list rules
+// /rules command - list rules directly from Cortex API (no Claude CLI cost)
 bot.command("rules", async (ctx) => {
   const arg = ctx.match?.trim();
   if (arg === "hard" || arg === "standard" || arg === "soft" || arg === "temporary") {
-    const response = await callClaude(`List all ${arg.toUpperCase()} rules from Cortex. Format: rule_id - description`, { model: "haiku" });
+    const response = await listRulesFromCortex(arg);
+    await sendResponse(ctx, response);
+  } else if (arg === "all") {
+    const response = await listRulesFromCortex();
     await sendResponse(ctx, response);
   } else {
     await ctx.reply(
       "Comenzi reguli:\n" +
-      "/rules hard - Reguli HARD (necesită TOTP)\n" +
+      "/rules hard - Reguli HARD\n" +
       "/rules standard - Reguli STANDARD\n" +
       "/rules soft - Reguli SOFT\n" +
       "/rules temporary - Reguli temporare\n" +
+      "/rules all - Toate regulile\n" +
       "/rule_modify RULE_ID - Modifică o regulă"
     );
   }
@@ -682,8 +687,8 @@ async function loadSharedMemory(): Promise<string> {
       .sort()
       .reverse();
     if (files.length > 0) {
-      const session = await readFile(join(MEMORY_DIR, files[0]), "utf-8");
-      parts.push("LATEST SESSION:\n" + session.substring(0, 2000));
+      const latest = await readFile(join(MEMORY_DIR, files[0]), "utf-8");
+      parts.push("LATEST SESSION:\n" + latest.substring(0, 2000));
     }
   } catch {}
   return parts.join("\n\n");
