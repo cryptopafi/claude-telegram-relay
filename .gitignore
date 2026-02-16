@@ -28,4 +28,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+*.bak
+*.bak2
+*.backup
+*.backup2
+*.tar.gz
 start-relay.sh
