@@ -90,12 +90,8 @@ n  // Basic auth for HTML endpoints
 export function loadVoiceConfig(): VoiceConfig {
   // Validate required env vars
   const required = [
-    'TELNYX_API_KEY',
-    'TELNYX_CONNECTION_ID',
-    'TELNYX_PHONE_NUMBER',
     'GOOGLE_TTS_API_KEY',
     'GROQ_API_KEY',
-    'ANTHROPIC_API_KEY',
     'TELEGRAM_BOT_TOKEN',
   ];
 

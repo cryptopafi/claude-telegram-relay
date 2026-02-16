@@ -40,6 +40,7 @@ const browserAudioBuffers = new Map<string, Buffer[]>();
 const VOICE_LLM_BACKEND = process.env.VOICE_LLM_BACKEND || 'groq';
 
 // Rate limiting
+let activeWsConnections = 0;
 const MAX_CONCURRENT_WS = 3;
 // BUG FIX #5: Per-session rate limiting (M-3 audit correction)
 const MAX_STT_PER_SESSION_PER_MINUTE = 30;
@@ -587,7 +588,7 @@ async function handleBrowserTestMessage(ws: any, sessionId: string, rawMessage: 
       ws.send(JSON.stringify({ type: 'status', status: 'thinking', text: 'Procesez...' }));
 
       const fullAudio = Buffer.concat(audioBuffer16k);
-      const transcription = await transcribeAudioBrowser(fullAudio);
+      const transcription = await transcribeAudioBrowser(fullAudio, sessionId);
 
       if (transcription) {
         console.log(`[BROWSER TEST] "${transcription}"`);
@@ -802,8 +803,8 @@ function startServer() {
         });
       }
 
-      // Genie personal voice app
-      if (url.pathname === '/voice/genie' && req.method === 'GET') {
+      // Claude Voice — personal voice app
+      if (url.pathname === '/voice/claude' && req.method === 'GET') {
       // SECURITY FIX #4: Basic auth — TEMPORARILY DISABLED for testing
       // const authHeader = req.headers.get('authorization');
       // if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
@@ -814,7 +815,7 @@ function startServer() {
       // }
 
         try {
-          let html = await Bun.file('./public/voice-genie.html').text();
+          let html = await Bun.file('./public/claude-voice.html').text();
           html = html.replace('__VOICE_WS_AUTH_KEY__', config.wsAuthKey);
           return new Response(html, { headers: { 'Content-Type': 'text/html' } });
         } catch (error) {
@@ -822,8 +823,8 @@ function startServer() {
         }
       }
 
-      // OpenClaw team voice panel
-      if ((url.pathname === '/voice/team' || url.pathname === '/voice/test-client') && req.method === 'GET') {
+      // OpenClaw Voice — team voice panel
+      if ((url.pathname === '/voice/openclaw' || url.pathname === '/voice/team' || url.pathname === '/voice/test-client') && req.method === 'GET') {
       // SECURITY FIX #4: Basic auth — TEMPORARILY DISABLED for testing
       // const authHeader = req.headers.get('authorization');
       // if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
@@ -834,7 +835,7 @@ function startServer() {
       // }
 
         try {
-          let html = await Bun.file('./public/voice-team.html').text();
+          let html = await Bun.file('./public/openclaw-voice.html').text();
           html = html.replace('__VOICE_WS_AUTH_KEY__', config.wsAuthKey);
           return new Response(html, { headers: { 'Content-Type': 'text/html' } });
         } catch (error) {
@@ -925,9 +926,8 @@ function startServer() {
         if (success) {
           return undefined;
         }
-
-      }
         return new Response('WebSocket upgrade failed', { status: 500 });
+      }
 
       // Serve PWA assets (manifest, service worker, icons)
       if (url.pathname === '/manifest.json' || url.pathname === '/manifest-genie.json' || url.pathname === '/manifest-team.json') {
