@@ -40,8 +40,7 @@ async function transcribeYouTubeAudio(videoId: string): Promise<string | null> {
     // Download audio only (ogg format, max 10 min)
     const dl = spawn([
       YT_DLP_PATH,
-      "--js-runtimes", "node",
-      "--remote-components", "ejs:github",
+      "--js-runtimes", `bun:${process.env.HOME}/.bun/bin/bun`,
       "--no-playlist",
       "--extract-audio",
       "--audio-format", "vorbis",
