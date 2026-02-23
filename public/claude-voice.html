@@ -309,7 +309,16 @@
     let isSpeaking = false;
     let isMuted = false;
     let audioUnlocked = false;
-    let audioQueue = [];
+    let currentAudioStreamId = null;
+    let activePlaybackSources = [];
+    let playbackCursorTime = 0;
+    let streamEndTimer = null;
+    let speakingEnergyFrames = 0;
+    let bargeInSent = false;
+
+    const BARGE_IN_THRESHOLD = 0.045;
+    const BARGE_IN_MIN_FRAMES = 3;
+    const STREAM_BOUNDARY_WAIT_MS = 140;
 
     // iOS requires audio to be "unlocked" by a user gesture
     function unlockAudio() {
@@ -365,6 +374,22 @@
       const opacity = Math.min(0.6, level * 2);
       volumeRing.style.transform = 'translate(-50%, -50%) scale(' + scale + ')';
       volumeRing.style.borderColor = 'rgba(10, 132, 255, ' + opacity + ')';
+
+      // Local barge-in detector: when user starts speaking over TTS, interrupt immediately.
+      if (isSpeaking && !isMuted) {
+        if (level > BARGE_IN_THRESHOLD) {
+          speakingEnergyFrames++;
+          if (speakingEnergyFrames >= BARGE_IN_MIN_FRAMES) {
+            triggerBargeIn();
+            speakingEnergyFrames = 0;
+          }
+        } else {
+          speakingEnergyFrames = Math.max(0, speakingEnergyFrames - 1);
+        }
+      } else {
+        speakingEnergyFrames = 0;
+        if (!isSpeaking) bargeInSent = false;
+      }
     }
 
     const audioWorkletCode = '\
@@ -426,7 +451,11 @@
           try {
             const message = JSON.parse(event.data);
             if (message.type === 'transcript') addMessage(message.role, message.text);
-            else if (message.type === 'audio') await playAudio(message.data);
+            else if (message.type === 'audio') await playAudioLegacy(message.data);
+            else if (message.type === 'audio_stream_start') startAudioStream(message);
+            else if (message.type === 'audio_chunk') enqueuePcmChunk(message);
+            else if (message.type === 'audio_stream_end') finishAudioStream(message);
+            else if (message.type === 'audio_stop') stopAllPlayback(false);
             else if (message.type === 'status') setCallStatus(message.status, message.text);
           } catch (error) { console.error('Message error:', error); }
         };
@@ -446,7 +475,106 @@
       ws.send(JSON.stringify({ type: 'audio', data: base64 }));
     }
 
-    async function playAudio(base64Audio) {
+    function stopAllPlayback(notifyServer = false) {
+      activePlaybackSources.forEach((src) => {
+        try { src.stop(0); } catch {}
+      });
+      activePlaybackSources = [];
+      if (streamEndTimer) {
+        clearTimeout(streamEndTimer);
+        streamEndTimer = null;
+      }
+      playbackCursorTime = 0;
+      currentAudioStreamId = null;
+      isSpeaking = false;
+      setCallStatus('listening', 'Ascult...');
+
+      if (notifyServer && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'barge_in' }));
+      }
+    }
+
+    function triggerBargeIn() {
+      if (bargeInSent) return;
+      bargeInSent = true;
+      stopAllPlayback(true);
+    }
+
+    function scheduleStreamIdleCheck(streamId) {
+      if (streamEndTimer) clearTimeout(streamEndTimer);
+      streamEndTimer = setTimeout(() => {
+        streamEndTimer = null;
+        if (currentAudioStreamId !== streamId) return;
+        if (activePlaybackSources.length > 0) return;
+        currentAudioStreamId = null;
+        isSpeaking = false;
+        setCallStatus('listening', 'Ascult...');
+      }, STREAM_BOUNDARY_WAIT_MS);
+    }
+
+    function startAudioStream(message) {
+      if (!audioContext || audioContext.state === 'closed') return;
+      if (streamEndTimer) {
+        clearTimeout(streamEndTimer);
+        streamEndTimer = null;
+      }
+      currentAudioStreamId = message.streamId;
+      isSpeaking = true;
+      setCallStatus('speaking', 'Genie vorbeste...');
+      if (audioContext.state === 'suspended') {
+        audioContext.resume().catch(() => {});
+      }
+      playbackCursorTime = Math.max(playbackCursorTime, audioContext.currentTime + 0.01);
+    }
+
+    function finishAudioStream(message) {
+      if (message.streamId !== currentAudioStreamId) return;
+      // Sentence boundary: keep stream alive briefly so next sentence chunks with same streamId append gaplessly.
+      scheduleStreamIdleCheck(message.streamId);
+    }
+
+    function enqueuePcmChunk(message) {
+      if (!audioContext || audioContext.state === 'closed') return;
+      if (message.streamId !== currentAudioStreamId) return;
+      if (!message.data) return;
+
+      const binaryString = atob(message.data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      if (bytes.length < 2) return;
+
+      const sampleCount = Math.floor(bytes.length / 2);
+      const sampleRate = Number(message.sampleRate || 24000);
+      const audioBuffer = audioContext.createBuffer(1, sampleCount, sampleRate);
+      const channel = audioBuffer.getChannelData(0);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+      for (let i = 0; i < sampleCount; i++) {
+        const sample = view.getInt16(i * 2, true);
+        channel[i] = sample / 32768;
+      }
+
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+
+      const startAt = Math.max(audioContext.currentTime + 0.01, playbackCursorTime);
+      playbackCursorTime = startAt + audioBuffer.duration;
+      source.onended = () => {
+        activePlaybackSources = activePlaybackSources.filter((s) => s !== source);
+        if (activePlaybackSources.length === 0 && !currentAudioStreamId && !streamEndTimer) {
+          isSpeaking = false;
+          setCallStatus('listening', 'Ascult...');
+        }
+      };
+
+      activePlaybackSources.push(source);
+      source.start(startAt);
+    }
+
+    async function playAudioLegacy(base64Audio) {
       try {
         isSpeaking = true;
         setCallStatus("speaking", "Genie vorbeste...");
@@ -473,7 +601,7 @@
 
     function endCall() {
       isConnected = false;
-      isSpeaking = false;
+      stopAllPlayback(false);
       if (ws) { ws.close(); ws = null; }
       if (audioWorkletNode) { audioWorkletNode.disconnect(); audioWorkletNode = null; }
       if (audioContext) { audioContext.close(); audioContext = null; }
