@@ -11,13 +11,8 @@ import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
-import {
-  processMemoryIntents,
-  getMemoryContext,
-  getRelevantContext,
-} from "./memory.ts";
+import { processMemoryIntents } from "./memory.ts";
 import { extractUrlContent, formatExtractedContent } from "./url-handler.ts";
 import { saveToSharedMemory, parseSaveTags } from "./memory-sync.ts";
 import { appendToLog } from "./file-logger.ts";
@@ -203,33 +198,6 @@ if (!BOT_TOKEN) {
 await mkdir(TEMP_DIR, { recursive: true });
 await mkdir(UPLOADS_DIR, { recursive: true });
 
-// ============================================================
-// SUPABASE (optional — only if configured)
-// ============================================================
-
-const supabase: SupabaseClient | null =
-  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
-    : null;
-
-async function saveMessage(
-  role: string,
-  content: string,
-  metadata?: Record<string, unknown>
-): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from("messages").insert({
-      role,
-      content,
-      channel: "telegram",
-      metadata: metadata || {},
-    });
-  } catch (error) {
-    console.error("Supabase save error:", error);
-  }
-}
-
 // Acquire lock
 if (!(await acquireLock())) {
   console.error("Could not acquire lock. Another instance may be running.");
@@ -382,7 +350,7 @@ bot.command("totp_setup", async (ctx) => {
 
 // /rules command - list rules directly from Cortex API (no Claude CLI cost)
 bot.command("rules", async (ctx) => {
-  const arg = ctx.match?.trim();
+  const arg = ctx.match?.trim()?.toLowerCase();
   if (arg === "hard" || arg === "standard" || arg === "soft" || arg === "temporary") {
     const response = await listRulesFromCortex(arg);
     await sendResponse(ctx, response);
@@ -391,14 +359,70 @@ bot.command("rules", async (ctx) => {
     await sendResponse(ctx, response);
   } else {
     await ctx.reply(
-      "Comenzi reguli:\n" +
-      "/rules hard - Reguli HARD\n" +
+      "📋 Comenzi reguli:\n" +
+      "/rules hard - Reguli HARD (necesită TOTP)\n" +
       "/rules standard - Reguli STANDARD\n" +
       "/rules soft - Reguli SOFT\n" +
       "/rules temporary - Reguli temporare\n" +
       "/rules all - Toate regulile\n" +
       "/rule_modify RULE_ID - Modifică o regulă"
     );
+  }
+});
+
+// /model command - view or switch OpenClaw agent models
+bot.command("model", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+
+  const arg = ctx.match?.trim() || "";
+  const MODEL_SWITCH_SCRIPT = join(process.env.HOME || "~", ".openclaw/scripts/model-switch.sh");
+
+  // Parse args: empty or "status" → status; "agent alias" → switch
+  let scriptArgs: string[];
+  if (arg === "" || arg.toLowerCase() === "status") {
+    scriptArgs = ["status"];
+  } else {
+    const parts = arg.split(/\s+/);
+    if (parts.length < 2) {
+      await ctx.reply(
+        "Folosire:\n" +
+        "/model — status curent\n" +
+        "/model status — status curent\n" +
+        "/model <agent> <alias> — schimbă modelul agentului\n\n" +
+        "Exemplu: /model tech haiku"
+      );
+      return;
+    }
+    scriptArgs = [parts[0], parts[1]];
+  }
+
+  try {
+    const proc = spawn(["bash", MODEL_SWITCH_SCRIPT, ...scriptArgs], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) {
+      const errMsg = stderr.trim() || `Script exited with code ${exitCode}`;
+      await ctx.reply(`Eroare model-switch:\n\`${errMsg}\``);
+      return;
+    }
+
+    const output = stdout.trim();
+    if (!output) {
+      await ctx.reply("Script rulat, fara output.");
+      return;
+    }
+
+    // Wrap in monospace for the status table
+    await sendResponse(ctx, "```\n" + output + "\n```");
+  } catch (error) {
+    console.error("Model switch error:", error);
+    await ctx.reply(`Eroare la rularea script-ului: ${(error as Error).message}`);
   }
 });
 
@@ -455,15 +479,12 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  await saveMessage("user", text);
   await addToHistory("user", text);
   await appendToLog("user", text);
   await storeTelegramMessage("user", text);
 
-  // Gather context: semantic search + facts/goals + conversation history + URLs + Cortex + procedures
-  const [relevantContext, memoryContext, sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
+  // Gather context: conversation history + URLs + Cortex + procedures
+  const [sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
     loadSharedMemory(),
     extractUrlContent(text),
     getCortexContext(text),
@@ -473,7 +494,7 @@ bot.on("message:text", async (ctx) => {
 
   const history = formatHistory();
   const urlContext = formatExtractedContent(urlContents);
-  let enrichedPrompt = buildPrompt(text, relevantContext, memoryContext, sharedMemory, cortexContext, cortexRules);
+  let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules);
   if (cortexProcedures) {
     enrichedPrompt += "\n\n" + cortexProcedures;
   }
@@ -487,7 +508,7 @@ bot.on("message:text", async (ctx) => {
   const rawResponse = await callClaude(enrichedPrompt, { resume: true, model });
 
   // Parse memory intents, save tags, and store procedures
-  const afterMemory = await processMemoryIntents(supabase, rawResponse);
+  const afterMemory = await processMemoryIntents(rawResponse);
   const afterCortex = await processCortexMemoryIntents(afterMemory);
   const afterProcedures = await processProcedureTags(afterCortex);
   const { cleaned: response, notes } = parseSaveTags(afterProcedures);
@@ -496,7 +517,6 @@ bot.on("message:text", async (ctx) => {
   }
 
   await addToHistory("assistant", response);
-  await saveMessage("assistant", response);
   await appendToLog("assistant", response);
   await storeTelegramMessage("assistant", response);
   // Auto-save important exchanges to Cortex (MEM-H-002)
@@ -530,13 +550,10 @@ bot.on("message:voice", async (ctx) => {
       return;
     }
 
-    await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
     await appendToLog("user", `[Voice ${voice.duration}s]: ${transcription}`);
     await storeTelegramMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
-      getRelevantContext(supabase, transcription),
-      getMemoryContext(supabase),
+    const [cortexContext, cortexRules, cortexProcedures] = await Promise.all([
       getCortexContext(transcription),
       getCortexRulesContext(),
       getCortexProcedures(transcription),
@@ -544,8 +561,6 @@ bot.on("message:voice", async (ctx) => {
 
     let enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
-      relevantContext,
-      memoryContext,
       undefined,
       cortexContext,
       cortexRules
@@ -555,11 +570,10 @@ bot.on("message:voice", async (ctx) => {
     }
     const voiceModel = detectModelLevel(transcription);
     const rawResponse = await callClaude(enrichedPrompt, { resume: true, model: voiceModel });
-    const afterMemory = await processMemoryIntents(supabase, rawResponse);
+    const afterMemory = await processMemoryIntents(rawResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const claudeResponse = await processProcedureTags(afterCortex);
 
-    await saveMessage("assistant", claudeResponse);
     await appendToLog("assistant", claudeResponse);
     await storeTelegramMessage("assistant", claudeResponse);
     // Auto-save important exchanges to Cortex (MEM-H-002)
@@ -596,7 +610,6 @@ bot.on("message:photo", async (ctx) => {
     const caption = ctx.message.caption || "Analyze this image.";
     const prompt = `[Image: ${filePath}]\n\n${caption}`;
 
-    await saveMessage("user", `[Image]: ${caption}`);
     await appendToLog("user", `[Image]: ${caption}`);
     await storeTelegramMessage("user", `[Image]: ${caption}`);
 
@@ -605,10 +618,9 @@ bot.on("message:photo", async (ctx) => {
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const afterMemory = await processMemoryIntents(supabase, claudeResponse);
+    const afterMemory = await processMemoryIntents(claudeResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const cleanResponse = await processProcedureTags(afterCortex);
-    await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
@@ -639,7 +651,6 @@ bot.on("message:document", async (ctx) => {
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
     const prompt = `[File: ${filePath}]\n\n${caption}`;
 
-    await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
     await appendToLog("user", `[Document: ${doc.file_name}]: ${caption}`);
     await storeTelegramMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
@@ -647,10 +658,9 @@ bot.on("message:document", async (ctx) => {
 
     await unlink(filePath).catch(() => {});
 
-    const afterMemory = await processMemoryIntents(supabase, claudeResponse);
+    const afterMemory = await processMemoryIntents(claudeResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const cleanResponse = await processProcedureTags(afterCortex);
-    await saveMessage("assistant", cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
@@ -699,8 +709,6 @@ const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolve
 
 function buildPrompt(
   userMessage: string,
-  relevantContext?: string,
-  memoryContext?: string,
   sharedMemory?: string,
   cortexContext?: string,
   cortexRules?: string
@@ -725,8 +733,6 @@ function buildPrompt(
   if (cortexRules) parts.push(`\n${cortexRules}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (sharedMemory) parts.push(`\n${sharedMemory}`);
-  if (memoryContext) parts.push(`\n${memoryContext}`);
-  if (relevantContext) parts.push(`\n${relevantContext}`);
   if (cortexContext) parts.push(`\n${cortexContext}`);
 
   parts.push(

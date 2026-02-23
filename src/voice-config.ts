@@ -21,12 +21,13 @@ export interface VoiceConfig {
 
   // Security
   security: {
-    allowedCallers: string[];  // Phone numbers allowed to call
-n  // Basic auth for HTML endpoints
+    allowedCallers: string[];
+  };
+
+  // Basic auth for HTML endpoints
   basicAuth: {
     username: string;
     password: string;
-  };
   };
 
   // Telegram alerts

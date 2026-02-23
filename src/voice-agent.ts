@@ -6,12 +6,12 @@
 
 import { serve } from 'bun';
 import Groq from 'groq-sdk';
-import { loadVoiceConfig, VOICE_SYSTEM_PROMPT, getVoiceSystemPrompt, getAgentProfile, type VoiceConfig, type AgentProfile } from './voice-config';
+import { loadVoiceConfig, VOICE_SYSTEM_PROMPT, getAgentProfile, type VoiceConfig, type AgentProfile } from './voice-config';
 import { VoiceSessionManager } from './voice-session';
 import { handleEmergency } from './voice-emergency';
 import { VoiceActivityDetector } from './voice-vad';
-import { generateCallSpeech, pcm16ToMulaw } from './voice-tts-call';
 import { getCortexProcedures } from './cortex-client';
+import { streamTTS } from './voice-tts-stream';
 
 // Global config and managers
 let config: VoiceConfig;
@@ -32,9 +32,18 @@ interface BrowserTestSession {
   startTime: number;
   conversationHistory: Array<{role: 'user' | 'assistant', content: string, timestamp: number}>;
 }
+
+interface BrowserAudioState {
+  currentStreamId: number;
+  ttsAbortController: AbortController | null;
+  llmAbortController: AbortController | null;
+  ttsChain: Promise<void>;
+}
+
 const browserTestSessions = new Map<string, BrowserTestSession>();
 const browserVadInstances = new Map<string, VoiceActivityDetector>();
 const browserAudioBuffers = new Map<string, Buffer[]>();
+const browserAudioStates = new Map<string, BrowserAudioState>();
 
 // LLM Backend: 'groq' (fast, free) or 'claude' (higher quality, slower)
 const VOICE_LLM_BACKEND = process.env.VOICE_LLM_BACKEND || 'groq';
@@ -455,7 +464,161 @@ async function getClaudeCLIResponse(prompt: string): Promise<string> {
     return '';
   }
 }
-async function getClaudeResponseBrowser(sessionId: string, userMessage: string): Promise<string> {
+
+function splitCompleteSentences(buffer: string): { complete: string[]; rest: string } {
+  const complete: string[] = [];
+  let start = 0;
+
+  for (let i = 0; i < buffer.length; i++) {
+    const ch = buffer[i];
+    const isBoundary = ch === '.' || ch === '!' || ch === '?' || ch === '\n';
+    if (!isBoundary) continue;
+
+    const next = buffer[i + 1] ?? '';
+    if (ch === '\n' || next === '' || /\s/.test(next)) {
+      const sentence = buffer.slice(start, i + 1).replace(/\s+/g, ' ').trim();
+      if (sentence) complete.push(sentence);
+      start = i + 1;
+    }
+  }
+
+  return { complete, rest: buffer.slice(start) };
+}
+
+async function streamGroqLLMSentences(
+  systemPrompt: string,
+  messages: Array<{role: string, content: string}>,
+  onSentence: (sentence: string) => Promise<void>,
+  signal?: AbortSignal
+): Promise<string> {
+  const groqMessages = [
+    { role: 'system' as const, content: systemPrompt },
+    ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+  ];
+
+  const stream = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: groqMessages,
+    max_tokens: 200,
+    temperature: 0.7,
+    stream: true,
+    // Groq SDK accepts fetch options internally; keep optional for cancellation.
+    ...(signal ? { signal } : {}),
+  } as any);
+
+  let fullText = '';
+  let sentenceBuffer = '';
+
+  for await (const chunk of stream as any) {
+    if (signal?.aborted) {
+      throw new Error('LLM stream aborted');
+    }
+
+    const delta = chunk?.choices?.[0]?.delta?.content ?? '';
+    if (!delta) continue;
+
+    fullText += delta;
+    sentenceBuffer += delta;
+
+    const split = splitCompleteSentences(sentenceBuffer);
+    sentenceBuffer = split.rest;
+    for (const sentence of split.complete) {
+      await onSentence(sentence);
+    }
+  }
+
+  const tail = sentenceBuffer.replace(/\s+/g, ' ').trim();
+  if (tail) {
+    await onSentence(tail);
+  }
+
+  return fullText.replace(/\s+/g, ' ').trim();
+}
+
+function getBrowserAudioState(sessionId: string): BrowserAudioState {
+  let state = browserAudioStates.get(sessionId);
+  if (!state) {
+    state = {
+      currentStreamId: 0,
+      ttsAbortController: null,
+      llmAbortController: null,
+      ttsChain: Promise.resolve(),
+    };
+    browserAudioStates.set(sessionId, state);
+  }
+  return state;
+}
+
+function stopBrowserAudioStream(sessionId: string, ws?: any, reason: string = 'interrupted') {
+  const state = getBrowserAudioState(sessionId);
+  state.currentStreamId++;
+
+  if (state.llmAbortController) {
+    state.llmAbortController.abort();
+    state.llmAbortController = null;
+  }
+  if (state.ttsAbortController) {
+    state.ttsAbortController.abort();
+    state.ttsAbortController = null;
+  }
+
+  if (ws && (ws as any).readyState === 1) {
+    ws.send(JSON.stringify({ type: 'audio_stop', reason }));
+    ws.send(JSON.stringify({ type: 'status', status: 'listening', text: 'Ascult...' }));
+  }
+}
+
+async function streamSentenceToBrowser(
+  ws: any,
+  sessionId: string,
+  sentence: string,
+): Promise<void> {
+  const cleaned = sentence.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return;
+  if (!checkRateLimit(sessionId, 'tts')) {
+    throw new Error('TTS rate limit exceeded');
+  }
+
+  const state = getBrowserAudioState(sessionId);
+  const streamId = state.currentStreamId;
+  const abortController = new AbortController();
+  state.ttsAbortController = abortController;
+
+  if ((ws as any).readyState === 1) {
+    ws.send(JSON.stringify({ type: 'status', status: 'speaking', text: 'Genie vorbeste...' }));
+    ws.send(JSON.stringify({ type: 'audio_stream_start', streamId, sampleRate: 24000 }));
+  }
+
+  try {
+    const streamInfo = await streamTTS({
+      text: cleaned,
+      groqApiKey: config.apiKeys.groq,
+      elevenLabsApiKey: process.env.ELEVENLABS_API_KEY || '',
+      signal: abortController.signal,
+      onChunk: async (chunk) => {
+        if (state.currentStreamId !== streamId || abortController.signal.aborted) return;
+        if ((ws as any).readyState !== 1) return;
+        ws.send(JSON.stringify({
+          type: 'audio_chunk',
+          streamId,
+          provider: chunk.provider,
+          sampleRate: chunk.sampleRate,
+          data: chunk.pcm16.toString('base64'),
+        }));
+      },
+    });
+
+    if (state.currentStreamId === streamId && (ws as any).readyState === 1) {
+      ws.send(JSON.stringify({ type: 'audio_stream_end', streamId, sampleRate: streamInfo.sampleRate }));
+    }
+  } finally {
+    if (state.ttsAbortController === abortController) {
+      state.ttsAbortController = null;
+    }
+  }
+}
+
+async function getClaudeResponseBrowser(sessionId: string, userMessage: string, ws: any): Promise<string> {
   const session = browserTestSessions.get(sessionId);
   if (!session) return 'Sesiune invalida';
 
@@ -472,75 +635,58 @@ async function getClaudeResponseBrowser(sessionId: string, userMessage: string):
   }
 
   const systemPrompt = session.agentProfile.systemPrompt + cortexContext + '\n\nIMPORTANT: Raspunde DOAR in limba romana. Maxim 1-3 propozitii, pentru conversatie vocala.';
+  const historyMessages = session.conversationHistory.slice(-10).map(m => ({ role: m.role, content: m.content }));
+  const state = getBrowserAudioState(sessionId);
+  const responseSegments: string[] = [];
 
-  let response = '';
-
-  if (VOICE_LLM_BACKEND === 'groq') {
-    const msgs = session.conversationHistory.slice(-10).map(m => ({ role: m.role, content: m.content }));
-    response = await getGroqLLMResponse(systemPrompt, msgs);
-
-    // Fallback to Claude CLI if Groq fails
-    if (!response) {
-      console.log('[VOICE] Groq failed, falling back to Claude CLI');
-      const history = session.conversationHistory.slice(-10).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
-      const cliPrompt = `${systemPrompt}\n\nConversation:\n${history}`;
-      response = await getClaudeCLIResponse(cliPrompt);
-    }
-  } else {
-    const history = session.conversationHistory.slice(-10).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
-    const cliPrompt = `${systemPrompt}\n\nConversation:\n${history}`;
-    response = await getClaudeCLIResponse(cliPrompt);
-  }
-
-  if (!response) {
-    return 'Scuze, am o problema tehnica momentan.';
-  }
-
-  session.conversationHistory.push({ role: 'assistant', content: response, timestamp: Date.now() });
-  return response;
-}
-
-/**
- * Generate browser speech (MP3 - iOS compatible)
- */
-async function generateBrowserSpeech(text: string, sessionId: string, voiceOverride?: { romanianVoice: string; englishVoice: string }): Promise<Buffer> {
-  if (!checkRateLimit(sessionId, 'tts')) {
-    throw new Error('TTS rate limit exceeded');
-  }
-  // Rate incremented in checkRateLimit
-  const cleanedText = text
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/`[^`]+`/g, '')
-    .replace(/https?:\/\/[^\s]+/g, '')
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!cleanedText) throw new Error('No valid text');
-
-  const romanianIndicators = ['ă', 'â', 'î', 'ș', 'ț', 'este', 'sunt'];
-  const isRo = romanianIndicators.some(ind => cleanedText.toLowerCase().includes(ind));
-  const voiceName = isRo
-    ? (voiceOverride?.romanianVoice || config.voice.romanianVoice)
-    : (voiceOverride?.englishVoice || config.voice.englishVoice);
-  const languageCode = isRo ? 'ro-RO' : 'en-US';
-
-  const requestBody = {
-    input: { text: cleanedText },
-    voice: { languageCode, name: voiceName },
-    audioConfig: { audioEncoding: 'MP3', sampleRateHertz: 24000, pitch: 0, speakingRate: 1.0 },
+  const queueSentence = (sentence: string) => {
+    const cleaned = sentence.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return;
+    responseSegments.push(cleaned);
+    state.ttsChain = state.ttsChain
+      .then(() => streamSentenceToBrowser(ws, sessionId, cleaned))
+      .catch((err) => {
+        console.error('[BROWSER TEST] Sentence TTS error:', err);
+      });
   };
 
-  const response = await fetch(
-    `https://texttospeech.googleapis.com/v1/text:synthesize?key=${config.apiKeys.google}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) }
-  );
+  if (VOICE_LLM_BACKEND === 'groq') {
+    state.llmAbortController = new AbortController();
+    try {
+      await streamGroqLLMSentences(
+        systemPrompt,
+        historyMessages,
+        async (sentence) => {
+          queueSentence(sentence);
+        },
+        state.llmAbortController.signal
+      );
+    } catch (error) {
+      if (!state.llmAbortController.signal.aborted) {
+        console.error('[VOICE] Groq stream failed, fallback to Claude CLI:', error);
+      }
+    } finally {
+      state.llmAbortController = null;
+    }
+  }
 
-  if (!response.ok) throw new Error(`TTS error: ${response.status}`);
-  const data = await response.json();
-  if (!data.audioContent) throw new Error('No audio');
-  return Buffer.from(data.audioContent, 'base64');
+  if (responseSegments.length === 0) {
+    const history = session.conversationHistory
+      .slice(-10)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .join('\n');
+    const cliPrompt = `${systemPrompt}\n\nConversation:\n${history}`;
+    const fallback = await getClaudeCLIResponse(cliPrompt);
+    if (fallback) {
+      queueSentence(fallback);
+    }
+  }
+
+  await state.ttsChain;
+
+  const response = responseSegments.join(' ').replace(/\s+/g, ' ').trim() || 'Scuze, am o problemă tehnică momentan.';
+  session.conversationHistory.push({ role: 'assistant', content: response, timestamp: Date.now() });
+  return response;
 }
 
 /**
@@ -558,6 +704,12 @@ function handleBrowserTestOpen(ws: any, sessionId: string, agentId: string = 'ge
     sampleRate: 8000,
   }));
   browserAudioBuffers.set(sessionId, []);
+  browserAudioStates.set(sessionId, {
+    currentStreamId: 0,
+    ttsAbortController: null,
+    llmAbortController: null,
+    ttsChain: Promise.resolve(),
+  });
 
   ws.send(JSON.stringify({ type: 'status', status: 'connected', text: 'Conectat' }));
 }
@@ -566,6 +718,13 @@ async function handleBrowserTestMessage(ws: any, sessionId: string, rawMessage: 
   try {
     const msgStr = typeof rawMessage === 'string' ? rawMessage : rawMessage.toString();
     const message = JSON.parse(msgStr);
+
+    if (message.type === 'barge_in') {
+      console.log(`[BROWSER TEST] Barge-in: ${sessionId}`);
+      stopBrowserAudioStream(sessionId, ws, 'barge_in');
+      return;
+    }
+
     if (message.type !== 'audio') return;
 
     const vad = browserVadInstances.get(sessionId);
@@ -594,19 +753,9 @@ async function handleBrowserTestMessage(ws: any, sessionId: string, rawMessage: 
         console.log(`[BROWSER TEST] "${transcription}"`);
         ws.send(JSON.stringify({ type: 'transcript', role: 'user', text: transcription }));
 
-        const response = await getClaudeResponseBrowser(sessionId, transcription);
+        const response = await getClaudeResponseBrowser(sessionId, transcription, ws);
         console.log(`[BROWSER TEST] "${response}"`);
         ws.send(JSON.stringify({ type: 'transcript', role: 'assistant', text: response }));
-
-        try {
-          const currentSession = browserTestSessions.get(sessionId);
-          const voiceOverride = currentSession ? { romanianVoice: currentSession.agentProfile.romanianVoice, englishVoice: currentSession.agentProfile.englishVoice } : undefined;
-          const ttsAudio = await generateBrowserSpeech(response, sessionId, voiceOverride);
-          console.log(`[BROWSER TEST] TTS audio generated: ${ttsAudio.length} bytes MP3 | Voice: ${currentSession?.agentProfile.romanianVoice}`);
-          ws.send(JSON.stringify({ type: 'audio', data: ttsAudio.toString('base64') }));
-        } catch (ttsError) {
-          console.error('[BROWSER TEST] TTS error:', ttsError);
-        }
         ws.send(JSON.stringify({ type: 'status', status: 'listening', text: 'Ascult...' }));
       }
       browserAudioBuffers.set(sessionId, []);
@@ -619,9 +768,11 @@ async function handleBrowserTestMessage(ws: any, sessionId: string, rawMessage: 
 
 function handleBrowserTestClose(sessionId: string) {
   console.log(`[BROWSER TEST] Closed: ${sessionId}`);
+  stopBrowserAudioStream(sessionId, undefined, 'session_closed');
   browserTestSessions.delete(sessionId);
   browserVadInstances.delete(sessionId);
   browserAudioBuffers.delete(sessionId);
+  browserAudioStates.delete(sessionId);
 }
 
 
@@ -805,14 +956,13 @@ function startServer() {
 
       // Claude Voice — personal voice app
       if (url.pathname === '/voice/claude' && req.method === 'GET') {
-      // SECURITY FIX #4: Basic auth — TEMPORARILY DISABLED for testing
-      // const authHeader = req.headers.get('authorization');
-      // if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
-      //   return new Response('Unauthorized', {
-      //     status: 401,
-      //     headers: { 'WWW-Authenticate': 'Basic realm="Voice System"' },
-      //   });
-      // }
+        const authHeader = req.headers.get('authorization');
+        if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
+          return new Response('Unauthorized', {
+            status: 401,
+            headers: { 'WWW-Authenticate': 'Basic realm="Voice System"' },
+          });
+        }
 
         try {
           let html = await Bun.file('./public/claude-voice.html').text();
@@ -825,14 +975,13 @@ function startServer() {
 
       // OpenClaw Voice — team voice panel
       if ((url.pathname === '/voice/openclaw' || url.pathname === '/voice/team' || url.pathname === '/voice/test-client') && req.method === 'GET') {
-      // SECURITY FIX #4: Basic auth — TEMPORARILY DISABLED for testing
-      // const authHeader = req.headers.get('authorization');
-      // if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
-      //   return new Response('Unauthorized', {
-      //     status: 401,
-      //     headers: { 'WWW-Authenticate': 'Basic realm="Voice System"' },
-      //   });
-      // }
+        const authHeader = req.headers.get('authorization');
+        if (!checkBasicAuth(authHeader, config.basicAuth.username, config.basicAuth.password)) {
+          return new Response('Unauthorized', {
+            status: 401,
+            headers: { 'WWW-Authenticate': 'Basic realm="Voice System"' },
+          });
+        }
 
         try {
           let html = await Bun.file('./public/openclaw-voice.html').text();

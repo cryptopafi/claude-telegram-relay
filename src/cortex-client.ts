@@ -405,7 +405,7 @@ export async function getCortexProcedures(query: string): Promise<string> {
         const quality = p.times_applied > 0
           ? ` [Success: ${Math.round((p.success_rate || 0) * 100)}% (${p.times_applied} uses)]`
           : " [Untested]";
-        const steps = p.solution_steps.map((s, idx) => `  ${idx + 1}. ${s}`).join("\n");
+        const steps = (p.solution_steps || []).map((s, idx) => `  ${idx + 1}. ${s}`).join("\n");
         return `${i + 1}. ${p.problem} [${p.domain}]${quality}\nID: ${p.id}\n${steps}`;
       })
       .join("\n\n")
