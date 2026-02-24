@@ -884,6 +884,13 @@ function buildPrompt(
 // TTS enabled via env var (default: on)
 const TTS_ENABLED = process.env.TTS_ENABLED !== "false";
 
+function splitIntoSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 20);
+}
+
 async function sendResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
@@ -917,15 +924,25 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 
   // Send voice version (non-blocking, after text)
   if (TTS_ENABLED) {
-    try {
-      const audioPath = await textToSpeech(response);
-      if (audioPath) {
+    const chunks = splitIntoSentences(response);
+    const ttsChunks = chunks.length > 0 ? chunks : [response];
+    let anySuccess = false;
+
+    for (const chunk of ttsChunks) {
+      try {
+        const audioPath = await textToSpeech(chunk);
+        if (!audioPath) continue;
+
         await ctx.replyWithVoice(new InputFile(audioPath));
         await cleanupTTS(audioPath);
+        anySuccess = true;
+      } catch (error) {
+        console.error("TTS chunk error:", error);
       }
-    } catch (error) {
-      console.error("TTS send error:", error);
-      // Silently fail - text was already sent
+    }
+
+    if (!anySuccess) {
+      console.warn("TTS: all chunks failed; text response already delivered.");
     }
   }
 }
