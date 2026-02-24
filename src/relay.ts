@@ -29,7 +29,8 @@ import {
 } from "./cortex-client.ts";
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
 import { textToSpeech, cleanupTTS } from "./tts.ts";
-import { createReadStream } from "fs";
+import { createReadStream, readFileSync, writeFileSync } from "fs";
+import { execSync } from "child_process";
 import { InputFile } from "grammy";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -48,6 +49,8 @@ const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claud
 const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-home-pafi/memory/memory");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
+const TASKS_FILE = "/Users/pafi/.claude/projects/-Users-pafi/memory/tasks/pafi-tasks.md";
+const TASKS_REPO_DIR = "/Users/pafi/.claude/projects/-Users-pafi";
 
 // Conversation history for context continuity
 const HISTORY_FILE = join(RELAY_DIR, "conversation-history.json");
@@ -335,6 +338,118 @@ let pendingTOTP: {
 } | null = null;
 
 // ============================================================
+// TASK MANAGEMENT (Telegram commands)
+// ============================================================
+
+function getActiveTaskLines(content: string, limit = 10): string[] {
+  const lines = content.split("\n");
+  const tasks: string[] = [];
+  let inActiveSection = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (/^##\s+Active\b/i.test(line)) {
+      inActiveSection = true;
+      continue;
+    }
+    if (inActiveSection && /^##\s+/.test(line)) break;
+    if (!inActiveSection) continue;
+    if (line.includes("- [ ]")) {
+      tasks.push(line);
+      if (tasks.length >= limit) break;
+    }
+  }
+  return tasks;
+}
+
+async function sendTelegram(chatId: string, message: string): Promise<void> {
+  if (!chatId) return;
+  await bot.api.sendMessage(chatId, message);
+}
+
+async function gitCommitAndPush(file: string, message: string): Promise<void> {
+  const relativePath = file.startsWith(TASKS_REPO_DIR + "/")
+    ? file.slice(TASKS_REPO_DIR.length + 1)
+    : file;
+
+  try {
+    execSync(`git -C "${TASKS_REPO_DIR}" add "${relativePath}"`, { stdio: "pipe" });
+    const status = execSync(`git -C "${TASKS_REPO_DIR}" status --short "${relativePath}"`, {
+      encoding: "utf-8",
+    }).trim();
+    if (!status) return;
+
+    execSync(`git -C "${TASKS_REPO_DIR}" commit -m ${JSON.stringify(message)}`, { stdio: "pipe" });
+    execSync(`git -C "${TASKS_REPO_DIR}" push origin main`, { stdio: "pipe", timeout: 30000 });
+  } catch (error) {
+    console.error("Git push failed:", error);
+  }
+}
+
+async function handleTaskCommand(text: string, chatId: string): Promise<boolean> {
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+
+  // Detect: list tasks
+  if (lower === "tasks" || lower === "/tasks") {
+    const content = readFileSync(TASKS_FILE, "utf-8");
+    const lines = getActiveTaskLines(content, 10);
+    const msg =
+      lines.length > 0
+        ? `📋 Active Tasks (${lines.length}):\n${lines.join("\n")}`
+        : "✅ No active tasks!";
+    await sendTelegram(chatId, msg);
+    return true;
+  }
+
+  // Detect: mark done — "gata cu X", "done X", "am terminat X"
+  const doneMatch = trimmed.match(/^(gata cu|done|am terminat)\s+(.+)$/i);
+  if (doneMatch) {
+    const taskText = doneMatch[2].trim();
+    const content = readFileSync(TASKS_FILE, "utf-8");
+    const lines = content.split("\n");
+    let found = false;
+    const today = new Date().toISOString().split("T")[0];
+    const updated = lines.map((line) => {
+      if (found) return line;
+      if (line.includes("- [ ]") && line.toLowerCase().includes(taskText.toLowerCase())) {
+        found = true;
+        const marked = line.replace("- [ ]", "- [x]");
+        if (/\(\d{4}-\d{2}-\d{2}\)\s*$/.test(marked)) return marked;
+        return `${marked} (${today})`;
+      }
+      return line;
+    });
+
+    if (found) {
+      writeFileSync(TASKS_FILE, updated.join("\n"));
+      await gitCommitAndPush(TASKS_FILE, `Task done via Telegram: ${taskText}`);
+      await sendTelegram(chatId, `✅ Task marcat ca done: "${taskText}"`);
+    } else {
+      await sendTelegram(chatId, `⚠️ Nu am gasit task cu "${taskText}". Verifica cu /tasks.`);
+    }
+    return true;
+  }
+
+  // Detect: add task — "adaugă task X", "add task X", "nou task X"
+  const addMatch = trimmed.match(/^(adaug(?:ă|a)\s+task|add\s+task|nou\s+task)\s+(.+)$/i);
+  if (addMatch) {
+    const taskText = addMatch[2].trim();
+    const content = readFileSync(TASKS_FILE, "utf-8");
+    const updated = /^## Active\s*$/m.test(content)
+      ? content.replace(/^## Active\s*$/m, `## Active\n- [ ] ${taskText}`)
+      : `${content.trimEnd()}\n\n## Active\n- [ ] ${taskText}\n`;
+
+    writeFileSync(TASKS_FILE, updated);
+    await gitCommitAndPush(TASKS_FILE, `Add task via Telegram: ${taskText}`);
+    await sendTelegram(chatId, `✅ Task adaugat: "${taskText}"`);
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================================
 // MESSAGE HANDLERS
 // ============================================================
 
@@ -456,9 +571,15 @@ bot.command("rule_modify", async (ctx) => {
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+  const chatId = ctx.chat?.id?.toString() || "";
   console.log(`Message: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
+
+  // Task command interception (skip Claude call when handled)
+  if (await handleTaskCommand(text, chatId)) {
+    return;
+  }
 
   // Check for pending TOTP verification
   if (pendingTOTP && /^\d{6}$/.test(text.trim())) {
