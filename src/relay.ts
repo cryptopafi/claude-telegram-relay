@@ -11,11 +11,11 @@ import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
-import { transcribe } from "./transcribe.ts";
-import { processMemoryIntents } from "./memory.ts";
-import { extractUrlContent, formatExtractedContent } from "./url-handler.ts";
-import { saveToSharedMemory, parseSaveTags } from "./memory-sync.ts";
-import { appendToLog } from "./file-logger.ts";
+import { transcribe } from "./transcribe";
+import { processMemoryIntents } from "./memory";
+import { extractUrlContent, formatExtractedContent } from "./url-handler";
+import { saveToSharedMemory, parseSaveTags } from "./memory-sync";
+import { appendToLog } from "./file-logger";
 import {
   processCortexMemoryIntents,
   getCortexContext,
@@ -26,9 +26,9 @@ import {
   checkCortexHealth,
   autoSaveToCortex,
   listRulesFromCortex,
-} from "./cortex-client.ts";
-import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp.ts";
-import { textToSpeech, cleanupTTS } from "./tts.ts";
+} from "./cortex-client";
+import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp";
+import { textToSpeech, cleanupTTS } from "./tts";
 import { createReadStream, readFileSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
 import { InputFile } from "grammy";
@@ -884,12 +884,6 @@ function buildPrompt(
 // TTS enabled via env var (default: on)
 const TTS_ENABLED = process.env.TTS_ENABLED !== "false";
 
-function splitIntoSentences(text: string): string[] {
-  return text
-    .split(/(?<=[.!?])\s+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length >= 20);
-}
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
@@ -922,29 +916,19 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
     }
   }
 
-  // Send voice version (non-blocking, after text)
-  if (TTS_ENABLED) {
-    const chunks = splitIntoSentences(response);
-    const ttsChunks = chunks.length > 0 ? chunks : [response];
-    let anySuccess = false;
-
-    for (const chunk of ttsChunks) {
-      try {
-        const audioPath = await textToSpeech(chunk);
-        if (!audioPath) continue;
-
-        await ctx.replyWithVoice(new InputFile(audioPath));
-        await cleanupTTS(audioPath);
-        anySuccess = true;
-      } catch (error) {
-        console.error("TTS chunk error:", error);
-      }
-    }
-
-    if (!anySuccess) {
-      console.warn("TTS: all chunks failed; text response already delivered.");
-    }
-  }
+  // TTS disabled — Pafi gets text only, no voice messages (2026-02-26)
+  // To re-enable: set TTS_ENABLED="true" in start-relay.sh and uncomment below
+  // if (TTS_ENABLED) {
+  //   try {
+  //     const audioPath = await textToSpeech(response);
+  //     if (audioPath) {
+  //       await ctx.replyWithVoice(new InputFile(audioPath));
+  //       await cleanupTTS(audioPath);
+  //     }
+  //   } catch (error) {
+  //     console.error("TTS error:", error);
+  //   }
+  // }
 }
 
 // ============================================================
@@ -960,7 +944,21 @@ checkCortexHealth().then((ok) => {
   if (!ok) console.warn("[CORTEX] WARNING: Cortex unreachable — auto-save disabled until reconnect");
 });
 
-bot.start({
+async function preparePollingSession(): Promise<void> {
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    console.log("[TG] deleteWebhook(drop_pending_updates=true) OK");
+  } catch (error) {
+    console.warn("[TG] deleteWebhook failed (continuing):", error);
+  }
+
+  // Wait out stale long-poll windows from previous instances (Telegram timeout is commonly 30s).
+  await Bun.sleep(35000);
+}
+
+await preparePollingSession();
+await bot.start({
+  drop_pending_updates: true,
   onStart: () => {
     console.log("Bot is running!");
   },
