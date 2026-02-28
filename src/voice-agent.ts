@@ -44,6 +44,12 @@ const browserTestSessions = new Map<string, BrowserTestSession>();
 const browserVadInstances = new Map<string, VoiceActivityDetector>();
 const browserAudioBuffers = new Map<string, Buffer[]>();
 const browserAudioStates = new Map<string, BrowserAudioState>();
+type VoiceWsData = {
+  sessionId?: string;
+  agentId?: string;
+  isBrowserTest?: boolean;
+  callControlId?: string;
+};
 
 // LLM Backend: 'groq' (fast, free) or 'claude' (higher quality, slower)
 const VOICE_LLM_BACKEND = process.env.VOICE_LLM_BACKEND || 'groq';
@@ -294,7 +300,8 @@ async function transcribeAudio(audioBuffer: Buffer, sessionId: string): Promise<
   try {
     // Wrap raw PCM16 in proper WAV container (Groq requires valid WAV headers)
     const wavBuffer = createWavBuffer(audioBuffer, 8000, 1, 16);
-    const audioFile = new File([wavBuffer], 'audio.wav', { type: 'audio/wav' });
+    const wavBytes = new Uint8Array(wavBuffer.buffer as ArrayBuffer, wavBuffer.byteOffset, wavBuffer.byteLength);
+    const audioFile = new File([wavBytes], 'audio.wav', { type: 'audio/wav' });
 
     const transcription = await groq.audio.transcriptions.create({
       file: audioFile,
@@ -387,7 +394,8 @@ async function transcribeAudioBrowser(audioBuffer: Buffer, sessionId: string): P
   // Rate incremented in checkRateLimit
   try {
     const wavBuffer = createWavBuffer(audioBuffer, 16000, 1, 16);
-    const audioFile = new File([wavBuffer], 'audio.wav', { type: 'audio/wav' });
+    const wavBytes = new Uint8Array(wavBuffer.buffer as ArrayBuffer, wavBuffer.byteOffset, wavBuffer.byteLength);
+    const audioFile = new File([wavBytes], 'audio.wav', { type: 'audio/wav' });
     const transcription = await groq.audio.transcriptions.create({
       file: audioFile,
       model: 'whisper-large-v3-turbo',
@@ -938,7 +946,7 @@ function handleTelnyxWsClose(callControlId: string) {
  * HTTP server
  */
 function startServer() {
-  const server = serve({
+  const server = serve<VoiceWsData>({
     port: config.server.port,
     hostname: config.server.host,
 

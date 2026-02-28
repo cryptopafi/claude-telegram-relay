@@ -281,6 +281,9 @@ export async function handleEmergency(
   if (detection.requiresConfirmation) {
     return getEmergencyResponse(detection.language, true);
   }
+  if (detection.severity === 'none') {
+    return null;
+  }
 
   // For critical/high: send alert immediately
   sendEmergencyAlert(

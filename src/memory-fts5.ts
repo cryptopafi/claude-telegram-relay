@@ -7,15 +7,22 @@ const DEFAULT_DB_PATH = process.env.MEMORY_DB_PATH || join(DEFAULT_RELAY_DIR, "m
 const PRUNE_THRESHOLD = 0.1;
 const SEMANTIC_HALF_LIFE_DAYS = 110;
 const EPISODIC_HALF_LIFE_DAYS = 7;
+const MAX_MEMORIES = 5000;
 
-const SEMANTIC_TRIGGER_RE = /\b(my|i am|i'm|prefer|remember|always|never|i like|i don't)\b/i;
+export const SEMANTIC_TRIGGER_RE =
+  /(?:^|[^\p{L}])(prefer|always|never|remember|I am|I'm|my name|I like|I don't|I do|I want|I need)(?:$|[^\p{L}])|(?:^|[^\p{L}])(prefer|mereu|niciodată|îmi place|nu îmi|ține minte|țin minte|eu sunt|vreau să|am nevoie|nu vreau|îmi trebuie|obișnuiesc)(?:$|[^\p{L}])/iu;
+
+export interface MemoryDBContext {
+  db: Database;
+  sessionId: string;
+}
 
 export function computeSalience(salience: number, halfLifeDays: number, createdAt: number): number {
   const daysElapsed = (Date.now() / 1000 - createdAt) / 86400;
   return salience * Math.exp((-daysElapsed * Math.LN2) / Math.max(halfLifeDays, 0.01));
 }
 
-export function initMemoryDB(dbPath = DEFAULT_DB_PATH): Database {
+export function initMemoryDB(dbPath = DEFAULT_DB_PATH): MemoryDBContext {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath, { create: true, strict: true });
 
@@ -58,7 +65,22 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH): Database {
     );
   `);
 
-  return db;
+  const sessionId = Date.now().toString();
+  db.query(
+    `INSERT OR IGNORE INTO sessions (id, started_at, last_message_at, message_count)
+     VALUES (?1, unixepoch(), unixepoch(), 0)`
+  ).run(sessionId);
+
+  return { db, sessionId };
+}
+
+export function updateSession(db: Database, sessionId: string): void {
+  db.query(
+    `UPDATE sessions
+     SET last_message_at = unixepoch(),
+         message_count = message_count + 1
+     WHERE id = ?1`
+  ).run(sessionId);
 }
 
 export function reinforceSalience(db: Database, memoryId: number): void {
@@ -82,18 +104,45 @@ export function reinforceSalience(db: Database, memoryId: number): void {
 
 export function pruneExpired(db: Database): number {
   const rows = db
-    .query("SELECT id, salience, half_life_days, created_at FROM memories")
-    .all() as Array<{ id: number; salience: number; half_life_days: number; created_at: number }>;
+    .query(
+      `SELECT id, salience, half_life_days,
+              (unixepoch('now') - created_at) / 86400.0 AS days_old
+       FROM memories`
+    )
+    .all() as Array<{ id: number; salience: number; half_life_days: number; days_old: number }>;
+
+  const expiredIds = rows
+    .filter((m) => {
+      const days = Number(m.days_old || 0);
+      const current =
+        Number(m.salience || 0) *
+        Math.exp((-days * Math.LN2) / Math.max(Number(m.half_life_days || 1), 0.01));
+      return current < PRUNE_THRESHOLD;
+    })
+    .map((m) => m.id);
 
   let removed = 0;
-  const del = db.query("DELETE FROM memories WHERE id = ?1");
-  for (const row of rows) {
-    const nowSalience = computeSalience(Number(row.salience || 0), Number(row.half_life_days || 1), Number(row.created_at || 0));
-    if (nowSalience < PRUNE_THRESHOLD) {
-      del.run(row.id);
-      removed += 1;
-    }
+  if (expiredIds.length > 0) {
+    const placeholders = expiredIds.map(() => "?").join(",");
+    db.query(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...expiredIds);
+    removed += expiredIds.length;
   }
+
+  const totalRow = db.query("SELECT COUNT(*) AS n FROM memories").get() as { n: number } | null;
+  const total = Number(totalRow?.n || 0);
+  if (total > MAX_MEMORIES) {
+    const excess = total - MAX_MEMORIES;
+    db.query(
+      `DELETE FROM memories
+       WHERE id IN (
+         SELECT id FROM memories
+         ORDER BY created_at ASC
+         LIMIT ?1
+       )`
+    ).run(excess);
+    removed += excess;
+  }
+
   return removed;
 }
 
@@ -170,8 +219,13 @@ export function extractAndSaveMemories(
   db: Database,
   userMessage: string,
   assistantResponse: string,
-  messageCount?: number
+  messageCount?: number,
+  sessionId?: string
 ): void {
+  if (sessionId) {
+    updateSession(db, sessionId);
+  }
+
   const semantic = pickSemanticSentence(userMessage);
   if (semantic) {
     saveMemory(db, semantic, "semantic");
@@ -186,7 +240,7 @@ export function extractAndSaveMemories(
 }
 
 export function runMaintenance(dbPath = DEFAULT_DB_PATH): { pruned: number; total: number; dbPath: string } {
-  const db = initMemoryDB(dbPath);
+  const { db } = initMemoryDB(dbPath);
   const pruned = pruneExpired(db);
   db.exec("VACUUM;");
   const row = db.query("SELECT COUNT(*) AS total FROM memories").get() as { total: number } | null;

@@ -11,7 +11,7 @@ import { Bot, Context } from "grammy";
 import { run } from "@grammyjs/runner";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join, dirname } from "path";
+import { join, dirname, extname } from "path";
 import { transcribe } from "./transcribe";
 import { processMemoryIntents } from "./memory";
 import { extractUrlContent, formatExtractedContent } from "./url-handler";
@@ -32,7 +32,7 @@ import {
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp";
 import { textToSpeech, cleanupTTS } from "./tts";
 import { createReadStream, readFileSync, writeFileSync } from "fs";
-import { execSync } from "child_process";
+import { execSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
@@ -207,7 +207,9 @@ if (!(await acquireLock())) {
 }
 
 const bot = new Bot(BOT_TOKEN);
-const memoryDb = initMemoryDB(MEMORY_DB_PATH);
+const memoryContext = initMemoryDB(MEMORY_DB_PATH);
+const memoryDb = memoryContext.db;
+const memorySessionId = memoryContext.sessionId;
 let processedMessageCount = 0;
 
 function memoryContextFor(userMessage: string): string {
@@ -222,7 +224,7 @@ function memoryContextFor(userMessage: string): string {
 function saveConversationMemories(userMessage: string, assistantResponse: string): void {
   try {
     processedMessageCount += 1;
-    extractAndSaveMemories(memoryDb, userMessage, assistantResponse, processedMessageCount);
+    extractAndSaveMemories(memoryDb, userMessage, assistantResponse, processedMessageCount, memorySessionId);
   } catch (error) {
     console.warn("[MEMORY] extractAndSaveMemories failed:", error);
   }
@@ -395,19 +397,45 @@ function getActiveTaskLines(content: string, limit = 10): string[] {
   const lines = content.split("\n");
   const tasks: string[] = [];
   let inActiveSection = false;
+  let idx = 0;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (/^##\s+Active\b/i.test(line)) {
-      inActiveSection = true;
-      continue;
-    }
+    if (/^##\s+Active\b/i.test(line)) { inActiveSection = true; continue; }
     if (inActiveSection && /^##\s+/.test(line)) break;
     if (!inActiveSection) continue;
-    if (line.includes("- [ ]")) {
-      tasks.push(line);
-      if (tasks.length >= limit) break;
+    if (!line.includes("- [ ]")) continue;
+
+    // Strip markdown: remove "- [ ]" and **bold**
+    let clean = line
+      .replace(/^-\s*\[.\]\s*/, "")
+      .replace(/\*\*/g, "")
+      .trim();
+
+    // Extract project from trailing (Nx Name) / (Bx Name) pattern, then remove from text
+    const projMatch = clean.match(/\(([A-Z]\d+\s+[^)]+)\)\s*$/);
+    let project = "";
+    if (projMatch) {
+      // e.g. "N2 Delphi" → "Delphi"
+      project = projMatch[1].replace(/^[A-Z]\d+\s+/, "").trim();
+      clean = clean.replace(/\s*\([A-Z]\d+[^)]*\)\s*$/, "").trim();
     }
+
+    // Assign color by urgency
+    const low = clean.toLowerCase();
+    let bullet: string;
+    if (/gmail|#3|landing page|agency|echelon|delphi.*bug|bi infra|pending_digest/i.test(low)) {
+      bullet = "🔴";
+    } else if (/codex|research|fts5|media handling|mission control|playwright|nexus comms/i.test(low)) {
+      bullet = "🟡";
+    } else {
+      bullet = "🔵";
+    }
+
+    idx++;
+    const projectTag = project ? ` (${project})` : "";
+    tasks.push(`${bullet} ${idx}. ${clean}${projectTag}`);
+    if (tasks.length >= limit) break;
   }
   return tasks;
 }
@@ -443,7 +471,7 @@ async function handleTaskCommand(text: string, chatId: string): Promise<boolean>
   // Detect: list tasks
   if (lower === "tasks" || lower === "/tasks") {
     const content = readFileSync(TASKS_FILE, "utf-8");
-    const lines = getActiveTaskLines(content, 10);
+    const lines = getActiveTaskLines(content, 30);
     const msg =
       lines.length > 0
         ? `📋 Active Tasks (${lines.length}):\n${lines.join("\n")}`
@@ -502,6 +530,13 @@ async function handleTaskCommand(text: string, chatId: string): Promise<boolean>
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
+
+function startTypingKeepalive(ctx: Context): ReturnType<typeof setInterval> {
+  ctx.replyWithChatAction("typing").catch(() => {});
+  return setInterval(() => {
+    ctx.replyWithChatAction("typing").catch(() => {});
+  }, 4000);
+}
 
 // /totp_setup command - generate new TOTP secret (admin only)
 bot.command("totp_setup", async (ctx) => {
@@ -610,7 +645,7 @@ bot.command("rule_modify", async (ctx) => {
       action: "modify",
       expiresAt: Date.now() + 90_000,
     };
-    await ctx.reply(`Regula ${ruleId} este HARD. Introdu codul TOTP din Google Authenticator (ai 90 secunde):`);
+    await ctx.reply(`🔐 Regula ${ruleId} este HARD. Introdu codul TOTP din Google Authenticator (ai 90 secunde):`);
     return;
   }
 
@@ -623,98 +658,153 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   const chatId = ctx.chat?.id?.toString() || "";
   console.log(`Message: ${text.substring(0, 50)}...`);
+  const typingInterval = startTypingKeepalive(ctx);
 
-  await ctx.replyWithChatAction("typing");
+  await ctx.react("👀").catch(() => {});
 
-  // Task command interception (skip Claude call when handled)
-  if (await handleTaskCommand(text, chatId)) {
-    return;
-  }
-
-  // Check for pending TOTP verification
-  if (pendingTOTP && /^\d{6}$/.test(text.trim())) {
-    if (Date.now() > pendingTOTP.expiresAt) {
-      pendingTOTP = null;
-      await ctx.reply("Codul TOTP a expirat. Folosește /rule_modify din nou.");
+  try {
+    // Task command interception (skip Claude call when handled)
+    if (await handleTaskCommand(text, chatId)) {
       return;
     }
 
-    if (verifyTOTP(text.trim())) {
-      const ruleId = pendingTOTP.ruleId;
-      pendingTOTP = null;
-      await ctx.reply(`TOTP verificat. Descrie modificarea pentru ${ruleId}:`);
-      // The next message will be handled as a normal rule modification
-    } else {
-      await ctx.reply("Cod TOTP incorect. Încearcă din nou (sau /rule_modify pentru a reîncepe).");
+    // /ingest command handler
+    if (text?.startsWith("/ingest")) {
+      const url = text.replace("/ingest", "").replace("--deep", "").replace("--opus", "").trim();
+      const forceOpus = text.includes("--deep") || text.includes("--opus");
+
+      if (!url) {
+        await ctx.reply(
+          "❓ Trimite un URL sau atașează un fișier cu /ingest\nEx: /ingest https://youtube.com/watch?v=xxx\nSau: /ingest --deep https://... (forțează Opus)"
+        );
+        return;
+      }
+
+      await ctx.reply("⚙️ SuperInsight pornit...");
+
+      const target = url;
+      const ingestScript = `${process.env.HOME}/.openclaw/scripts/ingest-smart.sh`;
+      const args = [ingestScript, target];
+      if (forceOpus) args.push("--deep");
+
+      const proc = nodeSpawn("bash", args, {
+        detached: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, TELEGRAM_TRIGGER: "true", CHAT_ID: String(chatId), SEND_INSIGHT_TELEGRAM: "true" },
+      });
+
+      let stderrOut = "";
+      proc.stderr?.on("data", (d: Buffer) => {
+        stderrOut += d.toString();
+      });
+
+      proc.on("close", async (code: number | null) => {
+        if (code === 0) {
+          await ctx.reply("✅ SuperInsight complet. Verifică @claudemacm4_bot pentru output.");
+        } else {
+          const hint = stderrOut.trim().slice(0, 180);
+          await ctx.reply(`❌ SuperInsight eșuat (exit ${code ?? "?"}). ${hint || "Verifică logs."}`);
+        }
+      });
+
+      return;
     }
-    return;
-  }
 
-  await addToHistory("user", text);
-  await appendToLog("user", text);
-  await storeTelegramMessage("user", text);
+    // Check for pending TOTP verification
+    if (pendingTOTP && /^\d{6}$/.test(text.trim())) {
+      if (Date.now() > pendingTOTP.expiresAt) {
+        pendingTOTP = null;
+        await ctx.reply("Codul TOTP a expirat. Folosește /rule_modify din nou.");
+        return;
+      }
 
-  // Gather context: conversation history + URLs + Cortex + procedures
-  const [sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
-    loadSharedMemory(),
-    extractUrlContent(text),
-    getCortexContext(text),
-    getCortexRulesContext(),
-    getCortexProcedures(text),
-  ]);
+      if (verifyTOTP(text.trim())) {
+        const ruleId = pendingTOTP.ruleId;
+        pendingTOTP = null;
+        await ctx.reply(`TOTP verificat. Descrie modificarea pentru ${ruleId}:`);
+        // The next message will be handled as a normal rule modification
+      } else {
+        await ctx.reply("Cod TOTP incorect. Încearcă din nou (sau /rule_modify pentru a reîncepe).");
+      }
+      return;
+    }
 
-  const history = formatHistory();
-  const urlContext = formatExtractedContent(urlContents);
-  let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules);
-  if (cortexProcedures) {
-    enrichedPrompt += "\n\n" + cortexProcedures;
-  }
-  if (urlContext) {
-    enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
-  }
-  if (history) {
-    enrichedPrompt = history + "\n\n" + enrichedPrompt;
-  }
-  const memCtx = memoryContextFor(text);
-  if (memCtx) {
-    enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
-  }
-  const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
-  const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
+    await addToHistory("user", text);
+    await appendToLog("user", text);
+    await storeTelegramMessage("user", text);
 
-  // Parse memory intents, save tags, and store procedures
-  const afterMemory = await processMemoryIntents(rawResponse);
-  const afterCortex = await processCortexMemoryIntents(afterMemory);
-  const afterProcedures = await processProcedureTags(afterCortex);
-  const { cleaned: response, notes } = parseSaveTags(afterProcedures);
-  for (const note of notes) {
-    await saveToSharedMemory(note);
-  }
+    // Gather context: conversation history + URLs + Cortex + procedures
+    const [sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
+      loadSharedMemory(),
+      extractUrlContent(text),
+      getCortexContext(text),
+      getCortexRulesContext(),
+      getCortexProcedures(text),
+    ]);
 
-  await addToHistory("assistant", response);
-  await appendToLog("assistant", response);
-  await storeTelegramMessage("assistant", response);
-  saveConversationMemories(text, response);
-  // Auto-save important exchanges to Cortex (MEM-H-002)
-  autoSaveToCortex(text, response).catch(() => {});
-  await sendResponse(ctx, response);
+    const history = formatHistory();
+    const urlContext = formatExtractedContent(urlContents);
+    let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules);
+    if (cortexProcedures) {
+      enrichedPrompt += "\n\n" + cortexProcedures;
+    }
+    if (urlContext) {
+      enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
+    }
+    if (history) {
+      enrichedPrompt = history + "\n\n" + enrichedPrompt;
+    }
+    const memCtx = memoryContextFor(text);
+    if (memCtx) {
+      enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
+    }
+    const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
+    const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
+
+    // Parse memory intents, save tags, and store procedures
+    const afterMemory = await processMemoryIntents(rawResponse);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const afterProcedures = await processProcedureTags(afterCortex);
+    const { cleaned: response, notes } = parseSaveTags(afterProcedures);
+    for (const note of notes) {
+      await saveToSharedMemory(note);
+    }
+
+    await addToHistory("assistant", response);
+    await appendToLog("assistant", response);
+    await storeTelegramMessage("assistant", response);
+    saveConversationMemories(text, response);
+    // Auto-save important exchanges to Cortex (MEM-H-002)
+    autoSaveToCortex(text, response).catch(() => {});
+    await sendResponse(ctx, response);
+    await ctx.react("👍").catch(() => {});
+  } catch (error) {
+    console.error("Text handler error:", error);
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply(`⚡ Eroare la procesarea mesajului
+Claude Code a returnat o eroare neașteptată. Încearcă din nou sau verifică: ~/.openclaw/logs/relay.log
+Detalii: ${(error as Error).message?.slice(0, 100) || "unknown"}`);
+  } finally {
+    clearInterval(typingInterval);
+  }
 });
 
 // Voice messages
 bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
   console.log(`Voice message: ${voice.duration}s`);
-  await ctx.replyWithChatAction("typing");
-
-  if (!process.env.VOICE_PROVIDER) {
-    await ctx.reply(
-      "Voice transcription is not set up yet. " +
-        "Run the setup again and choose a voice provider (Groq or local Whisper)."
-    );
-    return;
-  }
+  const typingInterval = startTypingKeepalive(ctx);
+  await ctx.react("👀").catch(() => {});
 
   try {
+    if (!process.env.VOICE_PROVIDER) {
+      await ctx.reply(
+        "Voice transcription is not set up yet. " +
+          "Run the setup again and choose a voice provider (Groq or local Whisper)."
+      );
+      return;
+    }
+
     const file = await ctx.getFile();
     const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
     const response = await fetch(url);
@@ -722,7 +812,8 @@ bot.on("message:voice", async (ctx) => {
 
     const transcription = await transcribe(buffer);
     if (!transcription) {
-      await ctx.reply("Could not transcribe voice message.");
+      await ctx.reply(`⚡ Transcriere eșuată
+Groq Whisper nu a putut procesa audio-ul (${voice.duration}s). Încearcă din nou sau trimite un mesaj text.`);
       return;
     }
 
@@ -762,16 +853,23 @@ bot.on("message:voice", async (ctx) => {
     // Auto-save important exchanges to Cortex (MEM-H-002)
     autoSaveToCortex(transcription, claudeResponse).catch(() => {});
     await sendResponse(ctx, claudeResponse);
+    await ctx.react("👍").catch(() => {});
   } catch (error) {
     console.error("Voice error:", error);
-    await ctx.reply("Could not process voice message. Check logs for details.");
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply(`⚡ Eroare la procesarea mesajului vocal
+Eroare neașteptată după transcriere. Încearcă din nou.
+Detalii: ${(error as Error).message?.slice(0, 100) || "unknown"}`);
+  } finally {
+    clearInterval(typingInterval);
   }
 });
 
 // Photos/Images
 bot.on("message:photo", async (ctx) => {
   console.log("Image received");
-  await ctx.replyWithChatAction("typing");
+  const typingInterval = startTypingKeepalive(ctx);
+  await ctx.react("👀").catch(() => {});
 
   try {
     // Get highest resolution photo
@@ -810,9 +908,13 @@ bot.on("message:photo", async (ctx) => {
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
+    await ctx.react("👍").catch(() => {});
   } catch (error) {
     console.error("Image error:", error);
-    await ctx.reply("Could not process image.");
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply("⚡ Nu am putut procesa imaginea.");
+  } finally {
+    clearInterval(typingInterval);
   }
 });
 
@@ -820,9 +922,15 @@ bot.on("message:photo", async (ctx) => {
 bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
   console.log(`Document: ${doc.file_name}`);
-  await ctx.replyWithChatAction("typing");
+  const typingInterval = startTypingKeepalive(ctx);
+  await ctx.react("👀").catch(() => {});
 
   try {
+    if ((doc.file_size || 0) > 20_000_000) {
+      await ctx.reply("⚠️ Document prea mare (>20MB).");
+      return;
+    }
+
     const file = await ctx.getFile();
     const timestamp = Date.now();
     const fileName = doc.file_name || `file_${timestamp}`;
@@ -853,9 +961,116 @@ bot.on("message:document", async (ctx) => {
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
+    await ctx.react("👍").catch(() => {});
   } catch (error) {
     console.error("Document error:", error);
-    await ctx.reply("Could not process document.");
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply("⚡ Nu am putut procesa documentul.");
+  } finally {
+    clearInterval(typingInterval);
+  }
+});
+
+// Video messages
+bot.on("message:video", async (ctx) => {
+  const video = ctx.message.video;
+  console.log(`Video message: ${video.duration}s`);
+  const typingInterval = startTypingKeepalive(ctx);
+  await ctx.react("👀").catch(() => {});
+
+  let filePath = "";
+  try {
+    if ((video.file_size || 0) > 20_000_000) {
+      await ctx.reply("⚠️ Video prea mare pentru download (>20MB). Trimite link sau comprimă.");
+      return;
+    }
+
+    const file = await ctx.getFile();
+    const timestamp = Date.now();
+    const ext = extname(file.file_path || "") || ".mp4";
+    filePath = join(UPLOADS_DIR, `video_${timestamp}${ext}`);
+
+    const response = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+    const buffer = await response.arrayBuffer();
+    await writeFile(filePath, Buffer.from(buffer));
+
+    const caption = ctx.message.caption || "Descrie acest video sau extrage informații relevante din el.";
+    const memCtx = memoryContextFor(caption);
+    const promptBody = `[Video saved at: ${filePath}]\nDuration: ${video.duration}s\n\n${caption}`;
+    const prompt = memCtx ? `${memCtx}\n\n${promptBody}` : promptBody;
+
+    await appendToLog("user", `[Video ${video.duration}s]: ${caption}`);
+    await storeTelegramMessage("user", `[Video ${video.duration}s]: ${caption}`);
+
+    const claudeResponse = await enqueueClaudeJob(() => callClaude(prompt, { resume: true }));
+    const afterMemory = await processMemoryIntents(claudeResponse);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const cleanResponse = await processProcedureTags(afterCortex);
+    saveConversationMemories(caption, cleanResponse);
+    await appendToLog("assistant", cleanResponse);
+    await storeTelegramMessage("assistant", cleanResponse);
+    await sendResponse(ctx, cleanResponse);
+    await ctx.react("👍").catch(() => {});
+  } catch (error) {
+    console.error("Video error:", error);
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply("⚡ Nu am putut procesa video-ul.");
+  } finally {
+    if (filePath) {
+      await unlink(filePath).catch(() => {});
+    }
+    clearInterval(typingInterval);
+  }
+});
+
+// Circular video notes
+bot.on("message:video_note", async (ctx) => {
+  const videoNote = ctx.message.video_note;
+  console.log(`Video note: ${videoNote.duration}s`);
+  const typingInterval = startTypingKeepalive(ctx);
+  await ctx.react("👀").catch(() => {});
+
+  let filePath = "";
+  try {
+    if ((videoNote.file_size || 0) > 20_000_000) {
+      await ctx.reply("⚠️ Video prea mare pentru download (>20MB). Trimite link sau comprimă.");
+      return;
+    }
+
+    const file = await ctx.getFile();
+    const timestamp = Date.now();
+    filePath = join(UPLOADS_DIR, `video_note_${timestamp}.mp4`);
+
+    const response = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+    const buffer = await response.arrayBuffer();
+    await writeFile(filePath, Buffer.from(buffer));
+
+    const userPrompt = "Transcrie sau descrie conținutul.";
+    const memCtx = memoryContextFor(userPrompt);
+    const promptBody = `[Video note (circular, ${videoNote.duration}s) saved at: ${filePath}]\nTranscrie sau descrie conținutul.`;
+    const prompt = memCtx ? `${memCtx}\n\n${promptBody}` : promptBody;
+
+    await appendToLog("user", `[Video note ${videoNote.duration}s]: ${userPrompt}`);
+    await storeTelegramMessage("user", `[Video note ${videoNote.duration}s]: ${userPrompt}`);
+
+    const claudeResponse = await enqueueClaudeJob(() => callClaude(prompt, { resume: true }));
+    const afterMemory = await processMemoryIntents(claudeResponse);
+    const afterCortex = await processCortexMemoryIntents(afterMemory);
+    const cleanResponse = await processProcedureTags(afterCortex);
+    saveConversationMemories(userPrompt, cleanResponse);
+    await appendToLog("assistant", cleanResponse);
+    await storeTelegramMessage("assistant", cleanResponse);
+    await sendResponse(ctx, cleanResponse);
+    await ctx.react("👍").catch(() => {});
+  } catch (error) {
+    console.error("Video note error:", error);
+    await ctx.react("⚡").catch(() => {});
+    await ctx.reply("⚡ Nu am putut procesa video-ul.");
+  } finally {
+    if (filePath) {
+      await unlink(filePath).catch(() => {});
+    }
+    clearInterval(typingInterval);
   }
 });
 
@@ -896,6 +1111,16 @@ async function loadSharedMemory(): Promise<string> {
 const USER_NAME = process.env.USER_NAME || "";
 const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+function detectLanguage(text: string): "ro" | "en" | "unknown" {
+  const roIndicators = /\b(sunt|este|pentru|care|sau|mai|cum|unde|cand|daca|poate|trebuie|vreau|bine|merci|salut|mulțumesc|în|și|că|ce|nu|da|am|la|cu|pe|de|din|să|te|ai|mă|îmi)\b/i;
+  const enIndicators = /\b(the|is|for|and|but|how|what|where|when|can|should|want|will|would|could|please|thanks|hello|good|with|from|this|that|have|has|are|was|were)\b/i;
+  const roCount = (text.match(roIndicators) || []).length;
+  const enCount = (text.match(enIndicators) || []).length;
+  if (roCount > enCount) return "ro";
+  if (enCount > roCount) return "en";
+  return "unknown";
+}
+
 function buildPrompt(
   userMessage: string,
   sharedMemory?: string,
@@ -912,13 +1137,21 @@ function buildPrompt(
     hour: "2-digit",
     minute: "2-digit",
   });
+  const hourNum = parseInt(now.toLocaleString("en-US", { timeZone: USER_TIMEZONE, hour: "numeric", hour12: false }));
+  const timeOfDay = hourNum >= 6 && hourNum < 12 ? "morning" :
+                    hourNum >= 12 && hourNum < 18 ? "afternoon" :
+                    hourNum >= 18 && hourNum < 23 ? "evening" : "night";
 
   const parts = [
-    "You are a personal AI assistant responding via Telegram. Keep responses concise and conversational.",
+    "You are Genie, Pafi's personal AI assistant on Telegram. You are not a generic chatbot — you are Pafi's dedicated operations partner.\n\nPERSONALITY:\n- Smart, direct, and warm. Like a trusted friend who also happens to be brilliant.\n- Concise by default. Telegram = short messages. No walls of text unless asked.\n- Match Pafi's language: if he writes in Romanian, respond in Romanian. If English, respond in English. Never mix unless he does.\n- Use humor sparingly but naturally. Never forced.\n- Never say \"As an AI\" or \"I don't have feelings\" — you're Genie, act like it.\n\nFORMATTING:\n- Keep messages under 500 characters when possible.\n- Use bullet points for lists.\n- No emojis unless contextually perfect (one max per message).\n- For code/technical output: use monospace blocks.\n- Break long responses into 2-3 short messages rather than one wall.\n\nRULES:\n- Never expose secrets, API keys, or tokens.\n- Memory tags ([REMEMBER], [GOAL], etc.) are mandatory when applicable — they are hidden from Pafi.\n- If you don't know something, say so. Don't fabricate.",
   ];
 
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
-  parts.push(`Current time: ${timeStr}`);
+  parts.push(`Current time: ${timeStr} (${timeOfDay})`);
+  const detectedLang = detectLanguage(userMessage);
+  if (detectedLang !== "unknown") {
+    parts.push(`Detected language: ${detectedLang === "ro" ? "Romanian" : "English"}. Respond in the same language.`);
+  }
   if (cortexRules) parts.push(`\n${cortexRules}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (sharedMemory) parts.push(`\n${sharedMemory}`);

@@ -63,7 +63,7 @@ async function main() {
   const bot = new Bot(TOKEN);
 
   const businessReport = await buildBusinessReport();
-  const personalReport = "*Personal*\n- No personal topics configured yet.";
+  const personalReport = `*Personal Report — ${isoDate()}*\n\n*Personal*\n- No personal topics configured yet.`;
 
   await bot.api.sendMessage(CHAT_ID, businessReport, { parse_mode: "Markdown" });
   await bot.api.sendMessage(CHAT_ID, personalReport, { parse_mode: "Markdown" });
