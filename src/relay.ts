@@ -17,6 +17,7 @@ import { processMemoryIntents } from "./memory";
 import { extractUrlContent, formatExtractedContent } from "./url-handler";
 import { saveToSharedMemory, parseSaveTags } from "./memory-sync";
 import { appendToLog } from "./file-logger";
+import { initMemoryDB, getMemoryContext, extractAndSaveMemories } from "./memory-fts5";
 import {
   processCortexMemoryIntents,
   getCortexContext,
@@ -45,6 +46,7 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const MEMORY_DB_PATH = join(RELAY_DIR, "memory.db");
 
 // Directories
 const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-home-pafi/memory/memory");
@@ -205,6 +207,26 @@ if (!(await acquireLock())) {
 }
 
 const bot = new Bot(BOT_TOKEN);
+const memoryDb = initMemoryDB(MEMORY_DB_PATH);
+let processedMessageCount = 0;
+
+function memoryContextFor(userMessage: string): string {
+  try {
+    return getMemoryContext(memoryDb, userMessage);
+  } catch (error) {
+    console.warn("[MEMORY] getMemoryContext failed:", error);
+    return "";
+  }
+}
+
+function saveConversationMemories(userMessage: string, assistantResponse: string): void {
+  try {
+    processedMessageCount += 1;
+    extractAndSaveMemories(memoryDb, userMessage, assistantResponse, processedMessageCount);
+  } catch (error) {
+    console.warn("[MEMORY] extractAndSaveMemories failed:", error);
+  }
+}
 
 // ============================================================
 // SECURITY: Only respond to authorized user
@@ -653,6 +675,10 @@ bot.on("message:text", async (ctx) => {
   if (history) {
     enrichedPrompt = history + "\n\n" + enrichedPrompt;
   }
+  const memCtx = memoryContextFor(text);
+  if (memCtx) {
+    enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
+  }
   const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
   const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
 
@@ -668,6 +694,7 @@ bot.on("message:text", async (ctx) => {
   await addToHistory("assistant", response);
   await appendToLog("assistant", response);
   await storeTelegramMessage("assistant", response);
+  saveConversationMemories(text, response);
   // Auto-save important exchanges to Cortex (MEM-H-002)
   autoSaveToCortex(text, response).catch(() => {});
   await sendResponse(ctx, response);
@@ -717,6 +744,10 @@ bot.on("message:voice", async (ctx) => {
     if (cortexProcedures) {
       enrichedPrompt += "\n\n" + cortexProcedures;
     }
+    const memCtx = memoryContextFor(transcription);
+    if (memCtx) {
+      enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
+    }
     const voiceModel = detectModelLevel(transcription);
     const rawResponse = await enqueueClaudeJob(() =>
       callClaude(enrichedPrompt, { resume: true, model: voiceModel })
@@ -724,6 +755,7 @@ bot.on("message:voice", async (ctx) => {
     const afterMemory = await processMemoryIntents(rawResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const claudeResponse = await processProcedureTags(afterCortex);
+    saveConversationMemories(transcription, claudeResponse);
 
     await appendToLog("assistant", claudeResponse);
     await storeTelegramMessage("assistant", claudeResponse);
@@ -759,7 +791,9 @@ bot.on("message:photo", async (ctx) => {
 
     // Claude Code can see images via file path
     const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `[Image: ${filePath}]\n\n${caption}`;
+    const memCtx = memoryContextFor(caption);
+    const promptBody = `[Image: ${filePath}]\n\n${caption}`;
+    const prompt = memCtx ? `${memCtx}\n\n${promptBody}` : promptBody;
 
     await appendToLog("user", `[Image]: ${caption}`);
     await storeTelegramMessage("user", `[Image]: ${caption}`);
@@ -772,6 +806,7 @@ bot.on("message:photo", async (ctx) => {
     const afterMemory = await processMemoryIntents(claudeResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const cleanResponse = await processProcedureTags(afterCortex);
+    saveConversationMemories(caption, cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
@@ -800,7 +835,9 @@ bot.on("message:document", async (ctx) => {
     await writeFile(filePath, Buffer.from(buffer));
 
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
-    const prompt = `[File: ${filePath}]\n\n${caption}`;
+    const memCtx = memoryContextFor(caption);
+    const promptBody = `[File: ${filePath}]\n\n${caption}`;
+    const prompt = memCtx ? `${memCtx}\n\n${promptBody}` : promptBody;
 
     await appendToLog("user", `[Document: ${doc.file_name}]: ${caption}`);
     await storeTelegramMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
@@ -812,6 +849,7 @@ bot.on("message:document", async (ctx) => {
     const afterMemory = await processMemoryIntents(claudeResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const cleanResponse = await processProcedureTags(afterCortex);
+    saveConversationMemories(caption, cleanResponse);
     await appendToLog("assistant", cleanResponse);
     await storeTelegramMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
