@@ -8,6 +8,7 @@
  */
 
 import { Bot, Context } from "grammy";
+import { run } from "@grammyjs/runner";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
@@ -179,10 +180,6 @@ process.on("SIGINT", async () => {
   await releaseLock();
   process.exit(0);
 });
-process.on("SIGTERM", async () => {
-  await releaseLock();
-  process.exit(0);
-});
 
 // ============================================================
 // SETUP
@@ -272,6 +269,37 @@ function detectModelLevel(text: string): ModelLevel {
 // ============================================================
 // CORE: Call Claude CLI
 // ============================================================
+
+const jobQueue: Array<() => Promise<void>> = [];
+let isJobQueueRunning = false;
+
+async function drainJobQueue(): Promise<void> {
+  if (isJobQueueRunning) return;
+  isJobQueueRunning = true;
+  try {
+    while (jobQueue.length > 0) {
+      const nextJob = jobQueue.shift();
+      if (nextJob) {
+        await nextJob();
+      }
+    }
+  } finally {
+    isJobQueueRunning = false;
+  }
+}
+
+function enqueueClaudeJob<T>(job: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    jobQueue.push(async () => {
+      try {
+        resolve(await job());
+      } catch (error) {
+        reject(error);
+      }
+    });
+    void drainJobQueue();
+  });
+}
 
 async function callClaude(
   prompt: string,
@@ -626,7 +654,7 @@ bot.on("message:text", async (ctx) => {
     enrichedPrompt = history + "\n\n" + enrichedPrompt;
   }
   const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true, model });
+  const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
 
   // Parse memory intents, save tags, and store procedures
   const afterMemory = await processMemoryIntents(rawResponse);
@@ -690,7 +718,9 @@ bot.on("message:voice", async (ctx) => {
       enrichedPrompt += "\n\n" + cortexProcedures;
     }
     const voiceModel = detectModelLevel(transcription);
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true, model: voiceModel });
+    const rawResponse = await enqueueClaudeJob(() =>
+      callClaude(enrichedPrompt, { resume: true, model: voiceModel })
+    );
     const afterMemory = await processMemoryIntents(rawResponse);
     const afterCortex = await processCortexMemoryIntents(afterMemory);
     const claudeResponse = await processProcedureTags(afterCortex);
@@ -734,7 +764,7 @@ bot.on("message:photo", async (ctx) => {
     await appendToLog("user", `[Image]: ${caption}`);
     await storeTelegramMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await enqueueClaudeJob(() => callClaude(prompt, { resume: true }));
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
@@ -775,7 +805,7 @@ bot.on("message:document", async (ctx) => {
     await appendToLog("user", `[Document: ${doc.file_name}]: ${caption}`);
     await storeTelegramMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await enqueueClaudeJob(() => callClaude(prompt, { resume: true }));
 
     await unlink(filePath).catch(() => {});
 
@@ -957,9 +987,15 @@ async function preparePollingSession(): Promise<void> {
 }
 
 await preparePollingSession();
-await bot.start({
-  drop_pending_updates: true,
-  onStart: () => {
-    console.log("Bot is running!");
-  },
+bot.catch((err) => {
+  console.error("[BOT ERROR]", err.message, err.ctx?.update);
+});
+
+const runner = run(bot);
+console.log("[BOT] Runner started");
+
+process.once("SIGTERM", () => {
+  console.log("[BOT] SIGTERM received, stopping...");
+  runner.stop();
+  void releaseLock().finally(() => process.exit(0));
 });
