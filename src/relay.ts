@@ -668,6 +668,43 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    // /ingest-deep command handler - always uses Opus
+    if (text?.startsWith("/ingest-deep") || text?.startsWith("/ingest_deep")) {
+      const msg = ctx.message;
+      const url = (text.startsWith("/ingest-deep")
+        ? text.replace("/ingest-deep", "")
+        : text.replace("/ingest_deep", "")).trim();
+
+      if (!url && !msg.document && !msg.photo) {
+        await ctx.reply("❓ Trimite un URL:\n/ingest-deep https://youtube.com/watch?v=xxx");
+        return;
+      }
+
+      await ctx.reply("⚙️ SuperInsight Deep (Opus) pornit...");
+
+      const ingestScript = `${process.env.HOME}/.openclaw/scripts/ingest-smart.sh`;
+      const target = url || "[file-attachment]";
+      const proc = nodeSpawn("bash", [ingestScript, target, "--deep"], {
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, TELEGRAM_TRIGGER: "true", CHAT_ID: String(chatId) },
+      });
+
+      proc.stderr?.on("data", (d: Buffer) => {
+        console.error("[ingest-deep]", d.toString());
+      });
+
+      proc.on("close", async (code: number | null) => {
+        if (code === 0) {
+          await ctx.reply("✅ SuperInsight Deep complet. Verifică @claudemacm4_bot.");
+        } else {
+          await ctx.reply(`❌ SuperInsight Deep eșuat (exit ${code ?? "?"}). Verifică logs.`);
+        }
+      });
+
+      return;
+    }
+
     // /ingest command handler
     if (text?.startsWith("/ingest")) {
       const msg = ctx.message;
