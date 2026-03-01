@@ -670,10 +670,20 @@ bot.on("message:text", async (ctx) => {
 
     // /ingest command handler
     if (text?.startsWith("/ingest")) {
-      const url = text.replace("/ingest", "").replace("--deep", "").replace("--opus", "").trim();
-      const forceOpus = text.includes("--deep") || text.includes("--opus");
+      const msg = ctx.message;
+      const normalizedText = text
+        ?.replace(/\u2014/g, "--")
+        ?.replace(/\u2013/g, "--")
+        ?.replace(/\u2012/g, "--");
+      const forceOpus =
+        normalizedText?.includes("--deep") || normalizedText?.includes("--opus");
+      const urlPart = normalizedText
+        ?.replace("/ingest", "")
+        ?.replace(/--deep|--opus/gi, "")
+        ?.trim();
+      const url = urlPart || "";
 
-      if (!url) {
+      if (!url && !msg.document && !msg.photo) {
         await ctx.reply(
           "❓ Trimite un URL sau atașează un fișier cu /ingest\nEx: /ingest https://youtube.com/watch?v=xxx\nSau: /ingest --deep https://... (forțează Opus)"
         );
@@ -682,28 +692,30 @@ bot.on("message:text", async (ctx) => {
 
       await ctx.reply("⚙️ SuperInsight pornit...");
 
-      const target = url;
+      const target = url || "[file-attachment]";
+      const opusFlag = forceOpus ? "--deep" : "";
       const ingestScript = `${process.env.HOME}/.openclaw/scripts/ingest-smart.sh`;
-      const args = [ingestScript, target];
-      if (forceOpus) args.push("--deep");
+      const args = [ingestScript, target, opusFlag].filter(Boolean);
 
       const proc = nodeSpawn("bash", args, {
-        detached: false,
+        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, TELEGRAM_TRIGGER: "true", CHAT_ID: String(chatId), SEND_INSIGHT_TELEGRAM: "true" },
+        env: { ...process.env, TELEGRAM_TRIGGER: "true", CHAT_ID: String(chatId) },
       });
 
-      let stderrOut = "";
+      let output = "";
+      proc.stdout?.on("data", (d: Buffer) => {
+        output += d.toString();
+      });
       proc.stderr?.on("data", (d: Buffer) => {
-        stderrOut += d.toString();
+        console.error("[ingest]", d.toString());
       });
 
       proc.on("close", async (code: number | null) => {
         if (code === 0) {
           await ctx.reply("✅ SuperInsight complet. Verifică @claudemacm4_bot pentru output.");
         } else {
-          const hint = stderrOut.trim().slice(0, 180);
-          await ctx.reply(`❌ SuperInsight eșuat (exit ${code ?? "?"}). ${hint || "Verifică logs."}`);
+          await ctx.reply(`❌ SuperInsight eșuat (exit ${code ?? "?"}). Verifică logs.`);
         }
       });
 
