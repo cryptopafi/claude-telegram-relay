@@ -13,7 +13,7 @@ describe("parseBiRunCommand", () => {
   });
 
   test("rejects invalid project slugs", () => {
-    expect(parseBiRunCommand("/bi-run ../bad")).toEqual({ mode: "project", slug: null });
+    expect(parseBiRunCommand("/bi-run ../bad")).toBeNull();
   });
 });
 

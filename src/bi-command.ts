@@ -1,7 +1,12 @@
-export type BiRunCommand = {
-  mode: "all" | "project";
-  slug: string | null;
-};
+export type BiRunCommand =
+  | {
+      mode: "all";
+      slug: null;
+    }
+  | {
+      mode: "project";
+      slug: string;
+    };
 
 export function parseBiRunCommand(text: string): BiRunCommand | null {
   const match = text.trim().match(/^\/bi(?:-run|_run)(?:@[\w_]+)?(?:\s+(.+))?$/i);
@@ -15,7 +20,7 @@ export function parseBiRunCommand(text: string): BiRunCommand | null {
   }
 
   if (!isValidBiSlug(rawArg)) {
-    return { mode: "project", slug: null };
+    return null;
   }
 
   return { mode: "project", slug: rawArg.toLowerCase() };

@@ -780,18 +780,47 @@ async function handleRadarAddCommand(ctx: Context, text: string): Promise<boolea
   return true;
 }
 
+async function getEnabledProjectCount(configPath: string, slug: string | null): Promise<number> {
+  try {
+    const rawConfig = await Bun.file(configPath).text();
+    const parsed = JSON.parse(rawConfig) as {
+      projects?: Array<{ slug?: unknown; enabled?: unknown }>;
+    };
+
+    const projects = Array.isArray(parsed.projects) ? parsed.projects : [];
+    const expectedSlug = slug ? slug.toLowerCase() : null;
+    const enabledCount = projects.filter((project) => {
+      if (!project || project.enabled !== true) return false;
+      if (!expectedSlug) return true;
+      return typeof project.slug === "string" && project.slug.toLowerCase() === expectedSlug;
+    }).length;
+
+    return Math.max(enabledCount, 1);
+  } catch (error) {
+    console.warn("[BI] Failed to parse bi-config.json, using conservative timeout:", error);
+    return 5;
+  }
+}
+
 async function handleBiRunCommand(ctx: Context, chatId: string, text: string): Promise<boolean> {
-  const parsed = parseBiRunCommand(text);
-  if (!parsed) {
+  const commandMatch = text.trim().match(/^\/bi(?:-run|_run)(?:@[\w_]+)?(?:\s+(.+))?$/i);
+  if (!commandMatch) {
     return false;
   }
 
-  if (parsed.mode === "project" && !parsed.slug) {
+  const rawArg = (commandMatch[1] || "").trim();
+  const parsed = parseBiRunCommand(text);
+  if (!parsed) {
+    if (rawArg) {
+      await ctx.reply("❌ Slug invalid. Folosire: /bi-run albastru");
+      return true;
+    }
     await ctx.reply("Folosire:\n/bi-run\n/bi-run albastru");
     return true;
   }
 
   const schedulerScript = join(process.env.HOME || "~", ".nexus", "bi-scheduler.sh");
+  const biConfigPath = join(process.env.HOME || "~", ".nexus", "bi-config.json");
   try {
     await Bun.file(schedulerScript).stat();
   } catch {
@@ -799,7 +828,11 @@ async function handleBiRunCommand(ctx: Context, chatId: string, text: string): P
     return true;
   }
 
-  const args = parsed.mode === "project" ? ["--project", parsed.slug!] : ["--all"];
+  const projectCount = await getEnabledProjectCount(biConfigPath, parsed.mode === "project" ? parsed.slug : null);
+  const timeoutMs = Math.min(Math.max(projectCount * 8 * 60 * 1000, 10 * 60 * 1000), 60 * 60 * 1000);
+  await ctx.reply(`BI: timeout calculat ${Math.round(timeoutMs / 60000)} min pentru ${projectCount} proiecte`);
+
+  const args = parsed.mode === "project" ? ["--project", parsed.slug] : ["--all"];
   await ctx.reply(parsed.mode === "project" ? `Pornesc BI pentru ${parsed.slug}...` : "Pornesc BI pentru toate proiectele...");
 
   const proc = nodeSpawn("/bin/bash", [schedulerScript, ...args], {
@@ -838,7 +871,7 @@ async function handleBiRunCommand(ctx: Context, chatId: string, text: string): P
   const timeout = setTimeout(() => {
     proc.kill("SIGTERM");
     setTimeout(() => proc.kill("SIGKILL"), 1000);
-  }, 10 * 60 * 1000);
+  }, timeoutMs);
 
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     proc.on("error", reject);
