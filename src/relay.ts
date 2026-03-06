@@ -811,11 +811,7 @@ async function handleBiRunCommand(ctx: Context, chatId: string, text: string): P
   const rawArg = (commandMatch[1] || "").trim();
   const parsed = parseBiRunCommand(text);
   if (!parsed) {
-    if (rawArg) {
-      await ctx.reply("❌ Slug invalid. Folosire: /bi-run albastru");
-      return true;
-    }
-    await ctx.reply("Folosire:\n/bi-run\n/bi-run albastru");
+    await ctx.reply(rawArg ? "❌ Slug invalid. Folosire: /bi-run albastru" : "Folosire:\n/bi-run\n/bi-run albastru");
     return true;
   }
 
@@ -830,7 +826,7 @@ async function handleBiRunCommand(ctx: Context, chatId: string, text: string): P
 
   const projectCount = await getEnabledProjectCount(biConfigPath, parsed.mode === "project" ? parsed.slug : null);
   const timeoutMs = Math.min(Math.max(projectCount * 8 * 60 * 1000, 10 * 60 * 1000), 60 * 60 * 1000);
-  await ctx.reply(`BI: timeout calculat ${Math.round(timeoutMs / 60000)} min pentru ${projectCount} proiecte`);
+  console.log(`[BI] timeout=${Math.round(timeoutMs / 60000)}min projects=${projectCount}`);
 
   const args = parsed.mode === "project" ? ["--project", parsed.slug] : ["--all"];
   await ctx.reply(parsed.mode === "project" ? `Pornesc BI pentru ${parsed.slug}...` : "Pornesc BI pentru toate proiectele...");
