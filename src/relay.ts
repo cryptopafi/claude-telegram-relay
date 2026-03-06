@@ -38,6 +38,7 @@ import {
   keywordsFromTopic,
   parseNexusCommand,
 } from "./nexus-command";
+import { parseBiRunCommand } from "./bi-command";
 import { createReadStream, readFileSync, writeFileSync } from "fs";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -779,6 +780,95 @@ async function handleRadarAddCommand(ctx: Context, text: string): Promise<boolea
   return true;
 }
 
+async function handleBiRunCommand(ctx: Context, chatId: string, text: string): Promise<boolean> {
+  const parsed = parseBiRunCommand(text);
+  if (!parsed) {
+    return false;
+  }
+
+  if (parsed.mode === "project" && !parsed.slug) {
+    await ctx.reply("Folosire:\n/bi-run\n/bi-run albastru");
+    return true;
+  }
+
+  const schedulerScript = join(process.env.HOME || "~", ".nexus", "bi-scheduler.sh");
+  try {
+    await Bun.file(schedulerScript).stat();
+  } catch {
+    await ctx.reply(`❌ BI scheduler lipsește: ${schedulerScript}`);
+    return true;
+  }
+
+  const args = parsed.mode === "project" ? ["--project", parsed.slug!] : ["--all"];
+  await ctx.reply(parsed.mode === "project" ? `Pornesc BI pentru ${parsed.slug}...` : "Pornesc BI pentru toate proiectele...");
+
+  const proc = nodeSpawn("/bin/bash", [schedulerScript, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      TELEGRAM_PAFI_CHAT_ID: process.env.TELEGRAM_PAFI_CHAT_ID || process.env.TELEGRAM_USER_ID || chatId,
+    },
+  });
+
+  let stdout = "";
+  let stderr = "";
+  let lineBuffer = "";
+
+  const flushLine = async (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    await ctx.reply(`BI: ${trimmed}`);
+  };
+
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    const textChunk = chunk.toString();
+    stdout += textChunk;
+    lineBuffer += textChunk;
+    const pieces = lineBuffer.split(/\r?\n/);
+    lineBuffer = pieces.pop() || "";
+    for (const piece of pieces) {
+      void flushLine(piece);
+    }
+  });
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  const timeout = setTimeout(() => {
+    proc.kill("SIGTERM");
+    setTimeout(() => proc.kill("SIGKILL"), 1000);
+  }, 10 * 60 * 1000);
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    proc.on("error", reject);
+    proc.on("close", resolve);
+  }).finally(() => {
+    clearTimeout(timeout);
+  }).catch(async (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.reply(`❌ BI spawn failed: ${message}`);
+    return null;
+  });
+
+  if (lineBuffer.trim()) {
+    await flushLine(lineBuffer);
+  }
+
+  if (exitCode === null) {
+    return true;
+  }
+
+  if (exitCode !== 0) {
+    const failure = (stderr.trim() || stdout.trim() || `exit ${exitCode}`).slice(0, 500);
+    await ctx.reply(`❌ BI run a eșuat: ${failure}`);
+    return true;
+  }
+
+  await ctx.reply("✅ BI run complet.");
+  return true;
+}
+
 async function gitCommitAndPush(file: string, message: string): Promise<void> {
   const relativePath = file.startsWith(TASKS_REPO_DIR + "/")
     ? file.slice(TASKS_REPO_DIR.length + 1)
@@ -1007,6 +1097,10 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (await handleRadarAddCommand(ctx, text)) {
+      return;
+    }
+
+    if (await handleBiRunCommand(ctx, chatId, text)) {
       return;
     }
 
