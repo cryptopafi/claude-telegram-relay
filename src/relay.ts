@@ -32,7 +32,7 @@ import {
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp";
 import { textToSpeech, cleanupTTS } from "./tts";
 import {
-  buildNexusCompletionMessage,
+  escapeTelegramMarkdownV2,
   keywordsFromTopic,
   parseNexusCommand,
 } from "./nexus-command";
@@ -451,6 +451,98 @@ async function sendTelegram(chatId: string, message: string): Promise<void> {
   await bot.api.sendMessage(chatId, message);
 }
 
+async function runNexusResearch(
+  chatId: string,
+  topic: string,
+  depth: "standard" | "deep",
+  iteration = 0
+): Promise<void> {
+  if (iteration > 0) {
+    await bot.api.sendMessage(chatId, `🔍 Aprofundez \\(iterația ${iteration}/3\\)\\.`, {
+      parse_mode: "MarkdownV2",
+    });
+  }
+
+  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-run.sh");
+  const env = {
+    ...process.env,
+    NEXUS_DEPTH: depth,
+    NEXUS_MODE: "1",
+    CORTEX_LOCAL_URL: process.env.CORTEX_LOCAL_URL || process.env.CORTEX_URL || "http://localhost:6400",
+    ECH_TOPIC_KEYWORDS: keywordsFromTopic(topic),
+  };
+
+  try {
+    await Bun.file(scriptPath).stat();
+  } catch {
+    await bot.api.sendMessage(chatId, `❌ NEXUS script lipsă: ${scriptPath}`);
+    return;
+  }
+
+  const proc = nodeSpawn(
+    "/bin/bash",
+    [scriptPath, "--topic", topic.slice(0, 200), "--depth", depth, "--mode", "manual", "--iteration", String(iteration)],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    }
+  );
+
+  let stdout = "";
+  let stderr = "";
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    proc.on("error", reject);
+    proc.on("close", resolve);
+  }).catch(async (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    await bot.api.sendMessage(chatId, `❌ NEXUS spawn failed: ${message}`);
+    return null;
+  });
+
+  if (exitCode === null) {
+    return;
+  }
+
+  if (exitCode !== 0) {
+    const failure = (stderr.trim() || stdout.trim() || `exit ${exitCode}`).slice(0, 500);
+    await bot.api.sendMessage(chatId, `❌ NEXUS research a eșuat: ${failure}`);
+    return;
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    const fallback = stdout.trim().slice(0, 500) || "invalid JSON output";
+    await bot.api.sendMessage(chatId, `⚠️ NEXUS finalizat, dar outputul nu a putut fi parsat corect: ${fallback}`);
+    return;
+  }
+
+  if (payload?.ok === false) {
+    const errMsg = String(payload?.error || "research failed").slice(0, 400);
+    await bot.api.sendMessage(chatId, `❌ NEXUS eșuat: ${errMsg}`);
+    return;
+  }
+
+  if (payload?.decision === "deepen" && iteration < 3 && payload?.new_topic) {
+    await runNexusResearch(chatId, String(payload.new_topic), depth, iteration + 1);
+    return;
+  }
+
+  const summary = String(payload?.summary || "Research complet.");
+  const safeSummary = escapeTelegramMarkdownV2(summary.slice(0, 400));
+  await bot.api.sendMessage(chatId, `🧠 *Nexus Research*\n\n${safeSummary}`, {
+    parse_mode: "MarkdownV2",
+  });
+}
+
 async function handleNexusCommand(ctx: Context, chatId: string, text: string): Promise<boolean> {
   const parsed = parseNexusCommand(text);
   if (!parsed) {
@@ -462,70 +554,9 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
     return true;
   }
 
-  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-run.sh");
-  const env = {
-    ...process.env,
-    NEXUS_DEPTH: parsed.depth,
-    NEXUS_MODE: "1",
-    CORTEX_LOCAL_URL: process.env.CORTEX_LOCAL_URL || process.env.CORTEX_URL || "http://localhost:6400",
-    ECH_TOPIC_KEYWORDS: keywordsFromTopic(parsed.topic),
-  };
-
   const safeTopic = parsed.topic.slice(0, 200);
   await ctx.reply(`Research în curs pentru: ${safeTopic}`);
-
-  try {
-    await Bun.file(scriptPath).stat();
-  } catch {
-    await ctx.reply(`❌ NEXUS script lipsă: ${scriptPath}`);
-    return true;
-  }
-
-  const proc = nodeSpawn("/bin/bash", [scriptPath, "--topic", safeTopic, "--depth", parsed.depth], {
-    stdio: ["ignore", "pipe", "pipe"],
-    env,
-  });
-
-  let stdout = "";
-  let stderr = "";
-  proc.stdout?.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString();
-  });
-  proc.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  proc.on("error", async (error: Error) => {
-    await bot.api.sendMessage(chatId, `❌ NEXUS spawn failed: ${error.message}`);
-  });
-
-  proc.on("close", async (code: number | null) => {
-    if (code !== 0) {
-      const failure = (stderr.trim() || stdout.trim() || `exit ${code ?? "?"}`).slice(0, 500);
-      await bot.api.sendMessage(chatId, `❌ NEXUS research a eșuat: ${failure}`);
-      return;
-    }
-
-    try {
-      const payload = JSON.parse(stdout);
-      if (payload.ok === false) {
-        const errMsg = String(payload.error || "synthesis failed").slice(0, 400);
-        await bot.api.sendMessage(chatId, `❌ NEXUS eșuat: ${errMsg}`);
-        return;
-      }
-      await bot.api.sendMessage(
-        chatId,
-        buildNexusCompletionMessage(
-          parsed.depth,
-          String(payload.telegram_summary || "Summary unavailable"),
-          String(payload.report_path || "unknown")
-        ),
-        { parse_mode: "MarkdownV2" }
-      );
-    } catch (error) {
-      const fallback = stdout.trim().slice(0, 500) || "invalid JSON output";
-      await bot.api.sendMessage(chatId, `⚠️ NEXUS finalizat, dar outputul nu a putut fi parsat corect: ${fallback}`);
-    }
-  });
+  await runNexusResearch(chatId, safeTopic, parsed.depth, 0);
 
   return true;
 }
