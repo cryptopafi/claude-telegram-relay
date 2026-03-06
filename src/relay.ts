@@ -461,7 +461,7 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
     return true;
   }
 
-  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-synthesize.py");
+  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-run.sh");
   const env = {
     ...process.env,
     NEXUS_DEPTH: parsed.depth,
@@ -470,7 +470,8 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
     ECH_TOPIC_KEYWORDS: keywordsFromTopic(parsed.topic),
   };
 
-  await ctx.reply(`Research în curs pentru: ${parsed.topic}`);
+  const safeTopic = parsed.topic.slice(0, 200);
+  await ctx.reply(`Research în curs pentru: ${safeTopic}`);
 
   try {
     await Bun.file(scriptPath).stat();
@@ -479,7 +480,7 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
     return true;
   }
 
-  const proc = nodeSpawn("python3", [scriptPath, "--topic", parsed.topic, "--depth", parsed.depth], {
+  const proc = nodeSpawn("/bin/bash", [scriptPath, "--topic", safeTopic, "--depth", parsed.depth], {
     stdio: ["ignore", "pipe", "pipe"],
     env,
   });
@@ -516,7 +517,7 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
       );
     } catch (error) {
       const fallback = stdout.trim().slice(0, 500) || "invalid JSON output";
-      await bot.api.sendMessage(chatId, `⚠️ NEXUS finalizat, dar outputul nu a putut fi pars at corect: ${fallback}`);
+      await bot.api.sendMessage(chatId, `⚠️ NEXUS finalizat, dar outputul nu a putut fi parsat corect: ${fallback}`);
     }
   });
 
