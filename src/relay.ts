@@ -600,17 +600,22 @@ async function runRadarAdd(url: string, cortexUrl: string): Promise<RadarAddResu
     return { ok: false, error: "radar-db addSource unavailable" };
   }
 
-  addSource({
-    type: detectRadarSourceType(url),
-    url,
-    title,
-    project_slugs: [],
-    status: "active",
-    cortex_collection: "research",
-    discovered_via: "manual",
-    tier: 2,
-    frequency: "daily",
-  });
+  try {
+    addSource({
+      type: detectRadarSourceType(url),
+      url,
+      title,
+      project_slugs: [],
+      status: "active",
+      cortex_collection: "research",
+      discovered_via: "manual",
+      tier: 2,
+      frequency: "daily",
+    });
+  } catch (err) {
+    const msg = String(err instanceof Error ? err.message : err).slice(0, 200);
+    return { ok: false, error: `Radar add eșuat: ${msg}` };
+  }
 
   return { ok: true, domain: String(payload.domain || new URL(url).hostname), title };
 }
