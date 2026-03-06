@@ -492,10 +492,28 @@ async function resolveNexusTopic(
       stderr += chunk.toString();
     });
 
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGTERM");
+      setTimeout(() => proc.kill("SIGKILL"), 1000);
+    }, 75_000);
+
     const exitCode = await new Promise<number | null>((resolve, reject) => {
       proc.on("error", reject);
       proc.on("close", resolve);
+    }).finally(() => {
+      clearTimeout(timeout);
     });
+
+    if (timedOut) {
+      const fallbackTopic = fallbackNexusTopicFromUrl(trimmed);
+      const escapedFallback = escapeTelegramMarkdownV2(fallbackTopic);
+      await bot.api.sendMessage(chatId, `⚠️ Router timeout — research pe URL slug: _${escapedFallback}_`, {
+        parse_mode: "MarkdownV2",
+      });
+      return fallbackTopic;
+    }
 
     if (exitCode !== 0) {
       throw new Error(stderr.trim() || `router exit ${exitCode}`);
