@@ -31,6 +31,11 @@ import {
 } from "./cortex-client";
 import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./totp";
 import { textToSpeech, cleanupTTS } from "./tts";
+import {
+  buildNexusCompletionMessage,
+  keywordsFromTopic,
+  parseNexusCommand,
+} from "./nexus-command";
 import { createReadStream, readFileSync, writeFileSync } from "fs";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -445,6 +450,79 @@ async function sendTelegram(chatId: string, message: string): Promise<void> {
   await bot.api.sendMessage(chatId, message);
 }
 
+async function handleNexusCommand(ctx: Context, chatId: string, text: string): Promise<boolean> {
+  const parsed = parseNexusCommand(text);
+  if (!parsed) {
+    return false;
+  }
+
+  if (!parsed.topic) {
+    await ctx.reply("Folosire:\n/nexus [topic]\n/nexus deep [topic]\n/nexus opus [topic]");
+    return true;
+  }
+
+  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-synthesize.py");
+  const env = {
+    ...process.env,
+    NEXUS_DEPTH: parsed.depth,
+    NEXUS_MODE: "1",
+    CORTEX_LOCAL_URL: process.env.CORTEX_LOCAL_URL || process.env.CORTEX_URL || "http://localhost:6400",
+    ECH_TOPIC_KEYWORDS: keywordsFromTopic(parsed.topic),
+  };
+
+  await ctx.reply(`Research în curs pentru: ${parsed.topic}`);
+
+  try {
+    await Bun.file(scriptPath).stat();
+  } catch {
+    await ctx.reply(`❌ NEXUS script lipsă: ${scriptPath}`);
+    return true;
+  }
+
+  const proc = nodeSpawn("python3", [scriptPath, "--topic", parsed.topic, "--depth", parsed.depth], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  });
+
+  let stdout = "";
+  let stderr = "";
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  proc.on("error", async (error: Error) => {
+    await bot.api.sendMessage(chatId, `❌ NEXUS spawn failed: ${error.message}`);
+  });
+
+  proc.on("close", async (code: number | null) => {
+    if (code !== 0) {
+      const failure = (stderr.trim() || stdout.trim() || `exit ${code ?? "?"}`).slice(0, 500);
+      await bot.api.sendMessage(chatId, `❌ NEXUS research a eșuat: ${failure}`);
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(stdout);
+      await bot.api.sendMessage(
+        chatId,
+        buildNexusCompletionMessage(
+          parsed.depth,
+          String(payload.telegram_summary || "Summary unavailable"),
+          String(payload.report_path || "unknown")
+        ),
+        { parse_mode: "MarkdownV2" }
+      );
+    } catch (error) {
+      const fallback = stdout.trim().slice(0, 500) || "invalid JSON output";
+      await bot.api.sendMessage(chatId, `⚠️ NEXUS finalizat, dar outputul nu a putut fi pars at corect: ${fallback}`);
+    }
+  });
+
+  return true;
+}
+
 async function gitCommitAndPush(file: string, message: string): Promise<void> {
   const relativePath = file.startsWith(TASKS_REPO_DIR + "/")
     ? file.slice(TASKS_REPO_DIR.length + 1)
@@ -665,6 +743,10 @@ bot.on("message:text", async (ctx) => {
   try {
     // Task command interception (skip Claude call when handled)
     if (await handleTaskCommand(text, chatId)) {
+      return;
+    }
+
+    if (await handleNexusCommand(ctx, chatId, text)) {
       return;
     }
 
