@@ -49,6 +49,25 @@ export function keywordsFromTopic(topic: string): string {
   return Array.from(new Set(tokens)).slice(0, 12).join(",");
 }
 
+export function isNexusUrlTopic(topic: string): boolean {
+  return /^https?:\/\//i.test(topic.trim());
+}
+
+export function fallbackNexusTopicFromUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    let pathname = parsed.pathname || "/";
+    pathname = pathname.replace(/\/{2,}/g, "/");
+    if (pathname !== "/" && pathname.endsWith("/")) {
+      pathname = pathname.slice(0, -1);
+    }
+    return `${host}${pathname}`.slice(0, 100);
+  } catch {
+    return rawUrl.trim().replace(/^https?:\/\//i, "").slice(0, 100);
+  }
+}
+
 export function buildNexusCompletionMessage(depth: NexusDepth, summary: string, reportPath: string): string {
   const escapedSummary = escapeTelegramMarkdownV2(String(summary || "Summary unavailable").slice(0, 400));
   const escapedPath = escapeTelegramMarkdownV2(reportPath || "unknown");

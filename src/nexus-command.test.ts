@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildNexusCompletionMessage,
+  fallbackNexusTopicFromUrl,
+  isNexusUrlTopic,
   keywordsFromTopic,
   parseNexusCommand,
 } from "./nexus-command";
@@ -35,6 +37,17 @@ describe("parseNexusCommand", () => {
 describe("keywordsFromTopic", () => {
   test("deduplicates and strips short fragments", () => {
     expect(keywordsFromTopic("AI agent AI ops for GTM in 2026")).toBe("agent,ops,for,gtm,2026");
+  });
+});
+
+describe("nexus url helpers", () => {
+  test("detects direct URLs", () => {
+    expect(isNexusUrlTopic("https://example.com/path")).toBe(true);
+    expect(isNexusUrlTopic("AI agents 2025")).toBe(false);
+  });
+
+  test("builds fallback topic from URL host and path", () => {
+    expect(fallbackNexusTopicFromUrl("https://www.instagram.com/p/DVRFb5TDPqN/")).toBe("instagram.com/p/DVRFb5TDPqN");
   });
 });
 
