@@ -39,6 +39,7 @@ import {
 import { createReadStream, readFileSync, writeFileSync } from "fs";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
+import { pathToFileURL } from "url";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -506,6 +507,11 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
 
     try {
       const payload = JSON.parse(stdout);
+      if (payload.ok === false) {
+        const errMsg = String(payload.error || "synthesis failed").slice(0, 400);
+        await bot.api.sendMessage(chatId, `❌ NEXUS eșuat: ${errMsg}`);
+        return;
+      }
       await bot.api.sendMessage(
         chatId,
         buildNexusCompletionMessage(
@@ -521,6 +527,126 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
     }
   });
 
+  return true;
+}
+
+type RadarAddResult =
+  | { ok: true; domain: string; title: string }
+  | { ok: false; error: string };
+
+function detectRadarSourceType(rawUrl: string): "github" | "youtube" | "reddit" | "website" {
+  const hostname = new URL(rawUrl).hostname.toLowerCase();
+  if (hostname === "github.com" || hostname.endsWith(".github.com")) return "github";
+  if (hostname === "youtube.com" || hostname.endsWith(".youtube.com") || hostname === "youtu.be") return "youtube";
+  if (hostname === "reddit.com" || hostname.endsWith(".reddit.com")) return "reddit";
+  return "website";
+}
+
+async function runRadarAdd(url: string, cortexUrl: string): Promise<RadarAddResult> {
+  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "source-discover.py");
+  const radarDbPath = join(process.env.HOME || "~", ".nexus", "radar", "radar-db.js");
+  const proc = nodeSpawn("python3", [scriptPath, "--url", url, "--cortex-url", cortexUrl], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, CORTEX_LOCAL_URL: cortexUrl },
+  });
+
+  let stdout = "";
+  let stderr = "";
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  const timeout = setTimeout(() => {
+    proc.kill("SIGTERM");
+    setTimeout(() => proc.kill("SIGKILL"), 1000);
+  }, 30_000);
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    proc.on("error", reject);
+    proc.on("close", resolve);
+  }).finally(() => {
+    clearTimeout(timeout);
+  });
+
+  if (exitCode !== 0) {
+    return { ok: false, error: (stderr.trim() || `exit ${exitCode ?? "?"}`).slice(0, 300) };
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(stdout.trim());
+  } catch {
+    return { ok: false, error: "invalid JSON response from source-discover.py" };
+  }
+
+  if (!payload?.ok || !payload?.profile_path) {
+    return { ok: false, error: String(payload?.error || stderr.trim() || "source discovery failed").slice(0, 300) };
+  }
+
+  let profile: any = {};
+  try {
+    profile = JSON.parse(await readFile(String(payload.profile_path), "utf-8"));
+  } catch {
+    profile = {};
+  }
+
+  const title = String(profile?.title || payload.domain || new URL(url).hostname);
+  const radarDb = await import(pathToFileURL(radarDbPath).href);
+  const addSource = radarDb.addSource || radarDb.default?.addSource;
+  if (typeof addSource !== "function") {
+    return { ok: false, error: "radar-db addSource unavailable" };
+  }
+
+  addSource({
+    type: detectRadarSourceType(url),
+    url,
+    title,
+    project_slugs: [],
+    status: "active",
+    cortex_collection: "research",
+    discovered_via: "manual",
+    tier: 2,
+    frequency: "daily",
+  });
+
+  return { ok: true, domain: String(payload.domain || new URL(url).hostname), title };
+}
+
+async function handleRadarAddCommand(ctx: Context, text: string): Promise<boolean> {
+  if (!text.trim().startsWith("/radar-add")) {
+    return false;
+  }
+
+  const urlToken = text.trim().split(/\s+/, 3)[1] || "";
+  if (!urlToken || urlToken.length > 500) {
+    await ctx.reply("❌ URL invalid");
+    return true;
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(urlToken);
+  } catch {
+    await ctx.reply("❌ URL invalid");
+    return true;
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    await ctx.reply("❌ URL invalid");
+    return true;
+  }
+
+  await ctx.reply(`Analizez sursa pentru Radar: ${parsedUrl.hostname}`);
+  const result = await runRadarAdd(parsedUrl.toString(), process.env.CORTEX_LOCAL_URL || process.env.CORTEX_URL || "http://localhost:6400");
+  if (result.ok === false) {
+    await ctx.reply(`⚠️ Radar: nu am putut procesa ${parsedUrl.toString()} — ${result.error}`);
+    return true;
+  }
+
+  await ctx.reply(`✅ Radar: ${result.domain} adăugat (${result.title})`);
   return true;
 }
 
@@ -748,6 +874,10 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (await handleNexusCommand(ctx, chatId, text)) {
+      return;
+    }
+
+    if (await handleRadarAddCommand(ctx, text)) {
       return;
     }
 
