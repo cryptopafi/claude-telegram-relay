@@ -550,6 +550,11 @@ async function runNexusResearch(
   depth: "standard" | "deep",
   iteration = 0
 ): Promise<void> {
+  if (iteration >= 3) {
+    await bot.api.sendMessage(chatId, "🧠 Nexus: limită iterații atinsă.");
+    return;
+  }
+
   if (iteration > 0) {
     await bot.api.sendMessage(chatId, `🔍 Aprofundez \\(iterația ${iteration}/3\\)\\.`, {
       parse_mode: "MarkdownV2",
