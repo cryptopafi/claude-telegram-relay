@@ -629,7 +629,7 @@ async function runNexusResearch(
     return;
   }
 
-  const summary = String(payload?.summary || "Research complet.");
+  const summary = String(payload?.telegram_summary || payload?.summary || "Research complet.");
   const safeSummary = escapeTelegramMarkdownV2(summary.slice(0, 400));
   await bot.api.sendMessage(chatId, `🧠 *Nexus Research*\n\n${safeSummary}`, {
     parse_mode: "MarkdownV2",
