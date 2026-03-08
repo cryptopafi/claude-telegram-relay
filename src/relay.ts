@@ -548,7 +548,8 @@ async function runNexusResearch(
   chatId: string,
   topic: string,
   depth: "standard" | "deep",
-  iteration = 0
+  iteration = 0,
+  mode: "manual" | "auto" = "manual"
 ): Promise<void> {
   if (iteration >= 3) {
     await bot.api.sendMessage(chatId, "🧠 Nexus: limită iterații atinsă.");
@@ -579,7 +580,7 @@ async function runNexusResearch(
 
   const proc = nodeSpawn(
     "/bin/bash",
-    [scriptPath, "--topic", topic.slice(0, 200), "--depth", depth, "--mode", "manual", "--iteration", String(iteration)],
+    [scriptPath, "--topic", topic.slice(0, 200), "--depth", depth, "--mode", mode, "--iteration", String(iteration)],
     {
       stdio: ["ignore", "pipe", "pipe"],
       env,
@@ -630,7 +631,7 @@ async function runNexusResearch(
   }
 
   if (payload?.decision === "deepen" && iteration < 3 && payload?.new_topic) {
-    await runNexusResearch(chatId, String(payload.new_topic), depth, iteration + 1);
+    await runNexusResearch(chatId, String(payload.new_topic), depth, iteration + 1, mode);
     return;
   }
 
@@ -648,14 +649,14 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
   }
 
   if (!parsed.topic) {
-    await ctx.reply("Folosire:\n/nexus [topic]\n/nexus deep [topic]\n/nexus opus [topic]");
+    await ctx.reply("Folosire:\n/nexus [topic]\n/nexus deep [topic]\n/nexus opus [topic]\n/nexus auto [topic]\n/nexus auto deep [topic]");
     return true;
   }
 
   const safeTopic = parsed.topic.slice(0, 200);
   const resolvedTopic = await resolveNexusTopic(chatId, safeTopic, parsed.depth);
   await ctx.reply(`Research în curs pentru: ${resolvedTopic}`);
-  await runNexusResearch(chatId, resolvedTopic, parsed.depth, 0);
+  await runNexusResearch(chatId, resolvedTopic, parsed.depth, 0, parsed.mode);
 
   return true;
 }

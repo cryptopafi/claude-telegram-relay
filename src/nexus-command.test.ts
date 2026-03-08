@@ -12,6 +12,7 @@ describe("parseNexusCommand", () => {
     expect(parseNexusCommand("/nexus ai agents")).toEqual({
       depth: "standard",
       topic: "ai agents",
+      mode: "manual",
     });
   });
 
@@ -19,10 +20,12 @@ describe("parseNexusCommand", () => {
     expect(parseNexusCommand("/nexus deep inference stack")).toEqual({
       depth: "deep",
       topic: "inference stack",
+      mode: "manual",
     });
     expect(parseNexusCommand("/nexus opus pricing")).toEqual({
       depth: "deep",
       topic: "pricing",
+      mode: "manual",
     });
   });
 
@@ -30,6 +33,20 @@ describe("parseNexusCommand", () => {
     expect(parseNexusCommand("/nexus@claudemacm4_bot deep market maps")).toEqual({
       depth: "deep",
       topic: "market maps",
+      mode: "manual",
+    });
+  });
+
+  test("parses auto mode variants", () => {
+    expect(parseNexusCommand("/nexus auto test topic")).toEqual({
+      depth: "standard",
+      topic: "test topic",
+      mode: "auto",
+    });
+    expect(parseNexusCommand("/nexus auto deep market maps")).toEqual({
+      depth: "deep",
+      topic: "market maps",
+      mode: "auto",
     });
   });
 });

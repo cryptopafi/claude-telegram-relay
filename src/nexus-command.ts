@@ -3,6 +3,7 @@ export type NexusDepth = "standard" | "deep";
 export interface NexusCommand {
   depth: NexusDepth;
   topic: string;
+  mode: "manual" | "auto";
 }
 
 const NEXUS_COMMAND_REGEX = /^\/nexus(?:@[\w_]+)?(?:\s+(.*))?$/i;
@@ -20,24 +21,36 @@ export function parseNexusCommand(text: string): NexusCommand | null {
 
   const remainder = (match[1] || "").trim();
   if (!remainder) {
-    return { depth: "standard", topic: "" };
+    return { depth: "standard", topic: "", mode: "manual" };
   }
 
   const lower = remainder.toLowerCase();
+  if (lower.startsWith("auto deep ")) {
+    return { depth: "deep", topic: remainder.slice(10).trim(), mode: "auto" };
+  }
+  if (lower === "auto deep") {
+    return { depth: "deep", topic: "", mode: "auto" };
+  }
+  if (lower.startsWith("auto ")) {
+    return { depth: "standard", topic: remainder.slice(5).trim(), mode: "auto" };
+  }
+  if (lower === "auto") {
+    return { depth: "standard", topic: "", mode: "auto" };
+  }
   if (lower.startsWith("deep ")) {
-    return { depth: "deep", topic: remainder.slice(5).trim() };
+    return { depth: "deep", topic: remainder.slice(5).trim(), mode: "manual" };
   }
   if (lower === "deep") {
-    return { depth: "deep", topic: "" };
+    return { depth: "deep", topic: "", mode: "manual" };
   }
   if (lower.startsWith("opus ")) {
-    return { depth: "deep", topic: remainder.slice(5).trim() };
+    return { depth: "deep", topic: remainder.slice(5).trim(), mode: "manual" };
   }
   if (lower === "opus") {
-    return { depth: "deep", topic: "" };
+    return { depth: "deep", topic: "", mode: "manual" };
   }
 
-  return { depth: "standard", topic: remainder };
+  return { depth: "standard", topic: remainder, mode: "manual" };
 }
 
 export function keywordsFromTopic(topic: string): string {
