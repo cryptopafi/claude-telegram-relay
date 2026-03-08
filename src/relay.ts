@@ -33,8 +33,6 @@ import { verifyTOTP, isTOTPConfigured, generateTOTPSetup, isHardRule } from "./t
 import { textToSpeech, cleanupTTS } from "./tts";
 import {
   escapeTelegramMarkdownV2,
-  fallbackNexusTopicFromUrl,
-  isNexusUrlTopic,
   keywordsFromTopic,
   parseNexusCommand,
 } from "./nexus-command";
@@ -454,96 +452,6 @@ async function sendTelegram(chatId: string, message: string): Promise<void> {
   await bot.api.sendMessage(chatId, message);
 }
 
-async function resolveNexusTopic(
-  chatId: string,
-  rawTopic: string,
-  depth: "standard" | "deep"
-): Promise<string> {
-  const trimmed = rawTopic.trim();
-  if (!isNexusUrlTopic(trimmed)) {
-    return rawTopic;
-  }
-
-  const routerScript = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-url-router.sh");
-  await bot.api.sendMessage(chatId, "🔗 URL detectat, ingerez conținutul.");
-
-  try {
-    await Bun.file(routerScript).stat();
-  } catch {
-    const fallbackTopic = fallbackNexusTopicFromUrl(trimmed);
-    await bot.api.sendMessage(chatId, `⚠️ Router lipsă. Continui research pe: ${fallbackTopic}`);
-    return fallbackTopic;
-  }
-
-  try {
-    const proc = nodeSpawn("/bin/bash", [routerScript, "--url", trimmed, "--depth", depth], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        CORTEX_LOCAL_URL: process.env.CORTEX_LOCAL_URL || process.env.CORTEX_URL || "http://localhost:6400",
-      },
-    });
-
-    let stdout = "";
-    let stderr = "";
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => proc.kill("SIGKILL"), 1000);
-    }, 75_000);
-
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-      proc.on("error", reject);
-      proc.on("close", resolve);
-    }).finally(() => {
-      clearTimeout(timeout);
-    });
-
-    if (timedOut) {
-      const fallbackTopic = fallbackNexusTopicFromUrl(trimmed);
-      const escapedFallback = escapeTelegramMarkdownV2(fallbackTopic);
-      await bot.api.sendMessage(chatId, `⚠️ Router timeout — research pe URL slug: _${escapedFallback}_`, {
-        parse_mode: "MarkdownV2",
-      });
-      return fallbackTopic;
-    }
-
-    if (exitCode !== 0) {
-      throw new Error(stderr.trim() || `router exit ${exitCode}`);
-    }
-
-    const parsed = JSON.parse(stdout.trim() || "{}");
-    const topic = String(parsed.topic || fallbackNexusTopicFromUrl(trimmed)).slice(0, 200);
-    const channel = String(parsed.channel || "web");
-    const ingested = parsed.ingested ? "ingestat" : "skip ingest";
-    const escapedTopic = escapeTelegramMarkdownV2(topic);
-    const escapedChannel = escapeTelegramMarkdownV2(channel);
-    await bot.api.sendMessage(chatId, `📥 ${escapedChannel}: ${ingested}\n🔍 Research pe: _${escapedTopic}_`, {
-      parse_mode: "MarkdownV2",
-    });
-    return topic;
-  } catch (error: unknown) {
-    const fallbackTopic = fallbackNexusTopicFromUrl(trimmed);
-    const message = error instanceof Error ? error.message : String(error);
-    const escapedFallback = escapeTelegramMarkdownV2(fallbackTopic);
-    const escapedMessage = escapeTelegramMarkdownV2(message.slice(0, 160));
-    await bot.api.sendMessage(
-      chatId,
-      `⚠️ Ingest URL eșuat \\(${escapedMessage}\\). Continui research pe: _${escapedFallback}_`,
-      { parse_mode: "MarkdownV2" }
-    );
-    return fallbackTopic;
-  }
-}
-
 async function runNexusResearch(
   chatId: string,
   topic: string,
@@ -584,9 +492,20 @@ async function runNexusResearch(
     stderr += chunk.toString();
   });
 
+  let timedOut = false;
+  const timeoutMs = depth === "deep" ? 600_000 : 300_000;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    console.error(`[NEXUS] Research timed out after ${Math.round(timeoutMs / 1000)}s`);
+    proc.kill("SIGTERM");
+    setTimeout(() => proc.kill("SIGKILL"), 5_000);
+  }, timeoutMs);
+
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     proc.on("error", reject);
     proc.on("close", resolve);
+  }).finally(() => {
+    clearTimeout(timeout);
   }).catch(async (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     await bot.api.sendMessage(chatId, `❌ NEXUS spawn failed: ${message}`);
@@ -597,7 +516,12 @@ async function runNexusResearch(
     return;
   }
 
-  if (exitCode !== 0) {
+  if (timedOut) {
+    stdout = JSON.stringify({ ok: false, error: "Research timed out" });
+    stderr = "";
+  }
+
+  if (exitCode !== 0 && !timedOut) {
     const failure = (stderr.trim() || stdout.trim() || `exit ${exitCode}`).slice(0, 500);
     await bot.api.sendMessage(chatId, `❌ NEXUS research a eșuat: ${failure}`);
     return;
