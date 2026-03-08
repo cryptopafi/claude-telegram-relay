@@ -16,15 +16,18 @@ describe("parseNexusCommand", () => {
     });
   });
 
-  test("parses deep and opus aliases", () => {
+  test("parses deep mode", () => {
     expect(parseNexusCommand("/nexus deep inference stack")).toEqual({
       depth: "deep",
       topic: "inference stack",
       mode: "manual",
     });
+  });
+
+  test("keeps non-deep modifiers as literal topic text", () => {
     expect(parseNexusCommand("/nexus opus pricing")).toEqual({
-      depth: "deep",
-      topic: "pricing",
+      depth: "standard",
+      topic: "opus pricing",
       mode: "manual",
     });
   });

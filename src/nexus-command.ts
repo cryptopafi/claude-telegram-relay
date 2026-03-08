@@ -43,12 +43,6 @@ export function parseNexusCommand(text: string): NexusCommand | null {
   if (lower === "deep") {
     return { depth: "deep", topic: "", mode: "manual" };
   }
-  if (lower.startsWith("opus ")) {
-    return { depth: "deep", topic: remainder.slice(5).trim(), mode: "manual" };
-  }
-  if (lower === "opus") {
-    return { depth: "deep", topic: "", mode: "manual" };
-  }
 
   return { depth: "standard", topic: remainder, mode: "manual" };
 }

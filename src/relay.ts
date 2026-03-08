@@ -548,21 +548,9 @@ async function runNexusResearch(
   chatId: string,
   topic: string,
   depth: "standard" | "deep",
-  iteration = 0,
   mode: "manual" | "auto" = "manual"
 ): Promise<void> {
-  if (iteration >= 3) {
-    await bot.api.sendMessage(chatId, "🧠 Nexus: limită iterații atinsă.");
-    return;
-  }
-
-  if (iteration > 0) {
-    await bot.api.sendMessage(chatId, `🔍 Aprofundez \\(iterația ${iteration}/3\\)\\.`, {
-      parse_mode: "MarkdownV2",
-    });
-  }
-
-  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-run.sh");
+  const scriptPath = join(process.env.HOME || "~", ".nexus", "echelon", "nexus-unified.sh");
   const env = {
     ...process.env,
     NEXUS_DEPTH: depth,
@@ -580,7 +568,7 @@ async function runNexusResearch(
 
   const proc = nodeSpawn(
     "/bin/bash",
-    [scriptPath, "--topic", topic.slice(0, 200), "--depth", depth, "--mode", mode, "--iteration", String(iteration)],
+    [scriptPath, "--input", topic.slice(0, 200), "--depth", depth, "--mode", mode],
     {
       stdio: ["ignore", "pipe", "pipe"],
       env,
@@ -630,16 +618,26 @@ async function runNexusResearch(
     return;
   }
 
-  if (payload?.decision === "deepen" && iteration < 3 && payload?.new_topic) {
-    await runNexusResearch(chatId, String(payload.new_topic), depth, iteration + 1, mode);
-    return;
-  }
-
   const summary = String(payload?.telegram_summary || payload?.summary || "Research complet.");
   const safeSummary = escapeTelegramMarkdownV2(summary.slice(0, 400));
   await bot.api.sendMessage(chatId, `🧠 *Nexus Research*\n\n${safeSummary}`, {
     parse_mode: "MarkdownV2",
   });
+
+  const htmlPath = String(payload?.html_path || "").trim();
+  if (!htmlPath) {
+    return;
+  }
+
+  try {
+    await Bun.file(htmlPath).stat();
+    await bot.api.sendDocument(chatId, new InputFile(htmlPath), {
+      caption: topic.slice(0, 200) || "Nexus report",
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    await bot.api.sendMessage(chatId, `⚠️ HTML report indisponibil: ${message.slice(0, 200)}`);
+  }
 }
 
 async function handleNexusCommand(ctx: Context, chatId: string, text: string): Promise<boolean> {
@@ -649,14 +647,13 @@ async function handleNexusCommand(ctx: Context, chatId: string, text: string): P
   }
 
   if (!parsed.topic) {
-    await ctx.reply("Folosire:\n/nexus [topic]\n/nexus deep [topic]\n/nexus opus [topic]\n/nexus auto [topic]\n/nexus auto deep [topic]");
+    await ctx.reply("Folosire:\n/nexus [topic]\n/nexus deep [topic]\n/nexus auto [topic]\n/nexus auto deep [topic]");
     return true;
   }
 
-  const safeTopic = parsed.topic.slice(0, 200);
-  const resolvedTopic = await resolveNexusTopic(chatId, safeTopic, parsed.depth);
-  await ctx.reply(`Research în curs pentru: ${resolvedTopic}`);
-  await runNexusResearch(chatId, resolvedTopic, parsed.depth, 0, parsed.mode);
+  const rawInput = parsed.topic.slice(0, 200);
+  await ctx.reply(`Research în curs pentru: ${rawInput}`);
+  await runNexusResearch(chatId, rawInput, parsed.depth, parsed.mode);
 
   return true;
 }
