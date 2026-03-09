@@ -37,6 +37,7 @@ import {
   parseNexusCommand,
 } from "./nexus-command";
 import { parseBiRunCommand } from "./bi-command";
+import { addRadarSourceFromUrl } from "./radar-add";
 import { createReadStream, readFileSync, writeFileSync } from "fs";
 import { execSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -707,6 +708,70 @@ async function handleRadarAddCommand(ctx: Context, text: string): Promise<boolea
   return true;
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+async function handleRadarLightAddCommand(ctx: Context, text: string): Promise<boolean> {
+  const match = text.trim().match(/^\/radar(?:@[\w_]+)?\s+add(?:\s+(.+))?$/i);
+  if (!match) {
+    return false;
+  }
+
+  const urlToken = (match[1] || "").trim().split(/\s+/, 1)[0] || "";
+  if (!urlToken) {
+    await ctx.reply("Folosire: /radar add https://example.com/feed");
+    return true;
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(urlToken);
+  } catch {
+    await ctx.reply("❌ URL invalid");
+    return true;
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    await ctx.reply("❌ URL invalid");
+    return true;
+  }
+
+  await ctx.reply(`Analizez sursa Radar: ${parsedUrl.hostname}`);
+  const addResult = await addRadarSourceFromUrl(parsedUrl.toString());
+
+  if (addResult.ok === false) {
+    if (addResult.code === "invalid_url") {
+      await ctx.reply("❌ URL invalid");
+      return true;
+    }
+    if (addResult.code === "exists") {
+      await ctx.reply("⚠️ URL deja există în radar-sources.yaml");
+      return true;
+    }
+    await ctx.reply(`⚠️ Radar add eșuat: ${addResult.error}`);
+    return true;
+  }
+
+  const confirmation = [
+    "📡 <b>Sursă adăugată în Radar</b>",
+    "",
+    `📌 ${escapeHtml(addResult.entry.name)}`,
+    `🔗 ${escapeHtml(addResult.entry.url)}`,
+    `📂 Tip: ${escapeHtml(addResult.entry.type)}`,
+    `🏷️ Vertical: ${escapeHtml(addResult.entry.vertical)}`,
+    "",
+    "<i>Activ la următorul sync. Editează vertical în radar-sources.yaml dacă e greșit.</i>",
+  ].join("\n");
+
+  await ctx.reply(confirmation, { parse_mode: "HTML" });
+  return true;
+}
+
 async function getEnabledProjectCount(configPath: string, slug: string | null): Promise<number> {
   try {
     const rawConfig = await Bun.file(configPath).text();
@@ -1049,6 +1114,10 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (await handleNexusCommand(ctx, chatId, text)) {
+      return;
+    }
+
+    if (await handleRadarLightAddCommand(ctx, text)) {
       return;
     }
 
