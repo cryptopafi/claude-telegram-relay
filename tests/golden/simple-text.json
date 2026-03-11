@@ -1,0 +1,6 @@
+{
+  "input": "Salut Lis, ce faci azi?",
+  "expected_contains": ["Assistant response ready"],
+  "expected_not_contains": ["<system>", "Fact-check enabled"],
+  "max_latency_ms": 2000
+}

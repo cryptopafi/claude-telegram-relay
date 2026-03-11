@@ -1,0 +1,6 @@
+{
+  "input": "Research and compare Bun runtime logging strategies for production relays.",
+  "expected_contains": ["Research workflow selected", "source verification"],
+  "expected_not_contains": ["<instructions>", "Unhandled"],
+  "max_latency_ms": 2500
+}

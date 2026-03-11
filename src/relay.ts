@@ -19,6 +19,8 @@ import { extractUrlContent, formatExtractedContent } from "./url-handler";
 import { saveToSharedMemory, parseSaveTags } from "./memory-sync";
 import { appendToLog } from "./file-logger";
 import { factCheck, logFactCheck } from "./fact-checker";
+import { isEnabled, getAllFlags } from "./feature-flags";
+import { startTrace, endTrace } from "./telemetry";
 import { initMemoryDB, getMemoryContext, extractAndSaveMemories } from "./memory-fts5";
 import {
   processCortexMemoryIntents,
@@ -1320,9 +1322,22 @@ redirect_agent: "${safeRedirect}"
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+  const messageId = ctx.message.message_id || Date.now();
+  const userId = ctx.from?.id?.toString() || "unknown";
+  const featureFlags = getAllFlags();
+  const activeFeatures = Object.entries(featureFlags)
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name);
+  startTrace(messageId);
+
   const chatId = ctx.chat?.id?.toString() || "";
   console.log(`Message: ${text.substring(0, 50)}...`);
   const typingInterval = startTypingKeepalive(ctx);
+  let traceBuildPromptMs = 0;
+  let traceFactCheckMs = 0;
+  let traceModel = "unknown";
+  let traceTokensUsed = estimateTokens(text);
+  let traceError: string | null = null;
 
   await ctx.react("👀").catch(() => {});
 
@@ -1479,6 +1494,7 @@ bot.on("message:text", async (ctx) => {
 
     const history = formatHistory();
     const urlContext = formatExtractedContent(urlContents);
+    const buildPromptStart = Date.now();
     let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules);
     if (cortexProcedures) {
       enrichedPrompt += "\n\n" + cortexProcedures;
@@ -1493,7 +1509,9 @@ bot.on("message:text", async (ctx) => {
     if (memCtx) {
       enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
     }
+    traceBuildPromptMs = Date.now() - buildPromptStart;
     const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
+    traceModel = model;
     const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
 
     // Parse memory intents, save tags, and store procedures
@@ -1505,16 +1523,23 @@ bot.on("message:text", async (ctx) => {
       await saveToSharedMemory(note);
     }
 
-    // Fact-check response before sending (PA Phase 2)
-    const fcResult = await factCheck(response).catch(() => ({
-      originalResponse: response,
-      processedResponse: response,
-      claimsFound: 0,
-      unverifiedClaims: [],
-      verificationSkipped: true,
-    }));
-    logFactCheck(fcResult, text);
-    const checkedResponse = fcResult.processedResponse;
+    // Fact-check response before sending (PA Phase 2, feature-gated)
+    let checkedResponse = response;
+    if (isEnabled("FEATURE_FACT_CHECK")) {
+      const factCheckStart = Date.now();
+      const fcResult = await factCheck(response).catch(() => ({
+        originalResponse: response,
+        processedResponse: response,
+        claimsFound: 0,
+        unverifiedClaims: [],
+        verificationSkipped: true,
+      }));
+      traceFactCheckMs = Date.now() - factCheckStart;
+      logFactCheck(fcResult, text);
+      checkedResponse = fcResult.processedResponse;
+    }
+
+    traceTokensUsed = estimateTokens(enrichedPrompt) + estimateTokens(checkedResponse);
 
     await addToHistory("assistant", checkedResponse);
     await appendToLog("assistant", checkedResponse);
@@ -1526,12 +1551,25 @@ bot.on("message:text", async (ctx) => {
     await ctx.react("👍").catch(() => {});
   } catch (error) {
     console.error("Text handler error:", error);
+    traceError = (error as Error).message?.slice(0, 300) || "unknown";
     await ctx.react("⚡").catch(() => {});
     await ctx.reply(`⚡ Eroare la procesarea mesajului
 Claude Code a returnat o eroare neașteptată. Încearcă din nou sau verifică: ~/.openclaw/logs/relay.log
 Detalii: ${(error as Error).message?.slice(0, 100) || "unknown"}`);
   } finally {
     clearInterval(typingInterval);
+    await endTrace(messageId, {
+      userId,
+      messageType: "text",
+      tokensUsed: traceTokensUsed,
+      model: traceModel,
+      featuresActive: activeFeatures,
+      error: traceError,
+      buildPromptMs: traceBuildPromptMs,
+      factCheckMs: traceFactCheckMs,
+    }).catch((error) => {
+      console.warn("[TELEMETRY] endTrace failed:", error);
+    });
   }
 });
 
@@ -1890,6 +1928,10 @@ function detectLanguage(text: string): "ro" | "en" | "unknown" {
   return "unknown";
 }
 
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
 function buildPrompt(
   userMessage: string,
   sharedMemory?: string,
@@ -2012,6 +2054,7 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
+console.log(`[FEATURE_FLAGS] ${JSON.stringify(getAllFlags())}`);
 if (!ALLOWED_USER_ID) {
   console.error("FATAL: TELEGRAM_USER_ID not set. Exiting.");
   process.exit(1);

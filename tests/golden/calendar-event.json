@@ -1,0 +1,6 @@
+{
+  "input": "Create a calendar event tomorrow at 10 for weekly planning.",
+  "expected_contains": ["Calendar event draft created"],
+  "expected_not_contains": ["<system>", "panic"],
+  "max_latency_ms": 2000
+}

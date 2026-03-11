@@ -1,0 +1,6 @@
+{
+  "input": "Can you fact-check this claim about GDP growth in 2025?",
+  "expected_contains": ["Fact-check path prepared"],
+  "expected_not_contains": ["Fact-check enabled", "<user_message>"],
+  "max_latency_ms": 2500
+}

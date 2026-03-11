@@ -1,0 +1,6 @@
+{
+  "input": "Please create a Codex task to implement telemetry budget alerts.",
+  "expected_contains": ["Task queued for Codex implementation"],
+  "expected_not_contains": ["<assistant>", "Error"],
+  "max_latency_ms": 2000
+}
