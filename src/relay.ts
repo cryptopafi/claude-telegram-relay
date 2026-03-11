@@ -21,6 +21,7 @@ import { appendToLog } from "./file-logger";
 import { factCheck, logFactCheck } from "./fact-checker";
 import { isEnabled, getAllFlags } from "./feature-flags";
 import { startTrace, endTrace } from "./telemetry";
+import { initDispatch } from "./dispatch";
 import { initMemoryDB, getMemoryContext, extractAndSaveMemories } from "./memory-fts5";
 import {
   processCortexMemoryIntents,
@@ -224,6 +225,7 @@ if (!(await acquireLock())) {
 }
 
 const bot = new Bot(BOT_TOKEN);
+const dispatch = initDispatch(bot, sendTelegram);
 const memoryContext = initMemoryDB(MEMORY_DB_PATH);
 const memoryDb = memoryContext.db;
 const memorySessionId = memoryContext.sessionId;
@@ -1338,33 +1340,41 @@ bot.on("message:text", async (ctx) => {
   let traceModel = "unknown";
   let traceTokensUsed = estimateTokens(text);
   let traceError: string | null = null;
+  let traceMessageType = "text";
+  let dispatchPromptHint = "";
 
   await ctx.react("👀").catch(() => {});
 
   try {
     // Task command interception (skip Claude call when handled)
     if (await handleTaskCommand(text, chatId)) {
+      traceMessageType = "command";
       return;
     }
 
     if (await handleNexusCommand(ctx, chatId, text)) {
+      traceMessageType = "command";
       return;
     }
 
     if (await handleRadarLightAddCommand(ctx, text)) {
+      traceMessageType = "command";
       return;
     }
 
     if (await handleRadarAddCommand(ctx, text)) {
+      traceMessageType = "command";
       return;
     }
 
     if (await handleBiRunCommand(ctx, chatId, text)) {
+      traceMessageType = "command";
       return;
     }
 
     // NexusOS approval gate response (OK/REJECT/REDIRECT)
     if (await handleApprovalResponse(ctx, text)) {
+      traceMessageType = "command";
       clearInterval(typingInterval);
       return;
     }
@@ -1479,6 +1489,19 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (isEnabled("FEATURE_SMART_DISPATCH")) {
+      const dispatchResult = await dispatch.handle(text, chatId);
+      if (dispatchResult.promptHint) {
+        dispatchPromptHint = dispatchResult.promptHint;
+      }
+      if (dispatchResult.skipClaude) {
+        if (dispatchResult.response) {
+          await sendTelegram(chatId, dispatchResult.response);
+        }
+        return;
+      }
+    }
+
     await addToHistory("user", text);
     await appendToLog("user", text);
     await storeTelegramMessage("user", text);
@@ -1495,7 +1518,7 @@ bot.on("message:text", async (ctx) => {
     const history = formatHistory();
     const urlContext = formatExtractedContent(urlContents);
     const buildPromptStart = Date.now();
-    let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules);
+    let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules, dispatchPromptHint);
     if (cortexProcedures) {
       enrichedPrompt += "\n\n" + cortexProcedures;
     }
@@ -1936,7 +1959,8 @@ function buildPrompt(
   userMessage: string,
   sharedMemory?: string,
   cortexContext?: string,
-  cortexRules?: string
+  cortexRules?: string,
+  dispatchHint?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -1976,6 +2000,7 @@ function buildPrompt(
       .replace("{{SENTINEL_HEALTH}}", sentinelHealth ? `System health:\n${escapeXmlContent(sentinelHealth)}` : "SENTINEL health: unknown (file not available)");
 
     const parts = [prompt];
+    if (dispatchHint) parts.push(`\n<dispatch_hint>\n${escapeXmlContent(dispatchHint)}\n</dispatch_hint>`);
     if (cortexRules) parts.push(`\n<cortex_rules>\n${escapeXmlContent(cortexRules)}\n</cortex_rules>`);
     if (sharedMemory) parts.push(`\n<shared_memory>\n${escapeXmlContent(sharedMemory)}\n</shared_memory>`);
     if (cortexContext) parts.push(`\n<cortex_context>\n${escapeXmlContent(cortexContext)}\n</cortex_context>`);
@@ -1991,6 +2016,7 @@ function buildPrompt(
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr} (${timeOfDay})`);
   if (cortexRules) parts.push(`\n${cortexRules}`);
+  if (dispatchHint) parts.push(`\nDispatch hint:\n${dispatchHint}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (sharedMemory) parts.push(`\n${sharedMemory}`);
   if (cortexContext) parts.push(`\n${cortexContext}`);
