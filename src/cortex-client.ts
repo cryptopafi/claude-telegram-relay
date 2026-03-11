@@ -114,7 +114,7 @@ async function storeInCortex(
 /**
  * Search Cortex knowledge base
  */
-async function searchCortex(
+export async function searchCortex(
   query: string,
   collection?: string,
   limit: number = 5

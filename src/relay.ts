@@ -12,11 +12,13 @@ import { run } from "@grammyjs/runner";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname, extname } from "path";
+import { homedir } from "os";
 import { transcribe } from "./transcribe";
 import { processMemoryIntents } from "./memory";
 import { extractUrlContent, formatExtractedContent } from "./url-handler";
 import { saveToSharedMemory, parseSaveTags } from "./memory-sync";
 import { appendToLog } from "./file-logger";
+import { factCheck, logFactCheck } from "./fact-checker";
 import { initMemoryDB, getMemoryContext, extractAndSaveMemories } from "./memory-fts5";
 import {
   processCortexMemoryIntents,
@@ -38,8 +40,8 @@ import {
 } from "./nexus-command";
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
-import { createReadStream, readFileSync, writeFileSync } from "fs";
-import { execSync, spawn as nodeSpawn } from "child_process";
+import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
+import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
 import { pathToFileURL } from "url";
 
@@ -57,11 +59,16 @@ const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claud
 const MEMORY_DB_PATH = join(RELAY_DIR, "memory.db");
 
 // Directories
-const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-home-pafi/memory/memory");
+const MEMORY_DIR = join(process.env.HOME || "~", ".claude/projects/-Users-pafi/memory");
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
 const TASKS_FILE = "/Users/pafi/.claude/projects/-Users-pafi/memory/tasks/pafi-tasks.md";
 const TASKS_REPO_DIR = "/Users/pafi/.claude/projects/-Users-pafi";
+const NEXUS_TASKS_DIR = "/Users/pafi/.nexus/tasks";
+const NEXUS_WORKSPACE_DIR = "/Users/pafi/.nexus/workspace";
+const NEXUS_SCRIPTS_DIR = "/Users/pafi/.nexus/scripts";
+const CANCELLABLE_TASK_STATES = new Set(["IDLE", "DISPATCHED", "CLAIMED", "BLOCKED"]);
+const TRANSITION_LOG = "/Users/pafi/.nexus/workspace/logs/state-transitions.log";
 
 // Conversation history for context continuity
 const HISTORY_FILE = join(RELAY_DIR, "conversation-history.json");
@@ -245,8 +252,7 @@ function saveConversationMemories(userMessage: string, assistantResponse: string
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id.toString();
 
-  // If ALLOWED_USER_ID is set, enforce it
-  if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
+  if (userId !== ALLOWED_USER_ID) {
     console.log(`Unauthorized: ${userId}`);
     await ctx.reply("This bot is private.");
     return;
@@ -291,11 +297,8 @@ function detectModelLevel(text: string): ModelLevel {
     if (pattern.test(text)) return "sonnet";
   }
 
-  // Long messages (>300 chars) likely need more capability
-  if (text.length > 300) return "sonnet";
-
-  // Default: haiku for simple/short messages
-  return "haiku";
+  // Default: sonnet for everything — Pafi wants at least Sonnet-level quality
+  return "sonnet";
 }
 
 // ============================================================
@@ -909,6 +912,37 @@ async function gitCommitAndPush(file: string, message: string): Promise<void> {
   }
 }
 
+function sanitizeCancelTaskId(rawTaskId: string): string {
+  return rawTaskId.replace(/<[^>]*>/g, "").trim().slice(0, 50);
+}
+
+function readTaskProgress(taskId: string): { path: string; content: string } | null {
+  const candidatePaths = [
+    // Phase 2 workspace paths (primary)
+    join(NEXUS_WORKSPACE_DIR, "active", taskId, "PROGRESS.md"),
+    join(NEXUS_WORKSPACE_DIR, "completed", taskId, "PROGRESS.md"),
+    // Legacy paths (fallback)
+    join(NEXUS_TASKS_DIR, "active", taskId, "PROGRESS.md"),
+    join(NEXUS_TASKS_DIR, "blocked", taskId, "PROGRESS.md"),
+    join(NEXUS_TASKS_DIR, "completed", taskId, "PROGRESS.md"),
+  ];
+
+  for (const path of candidatePaths) {
+    try {
+      return { path, content: readFileSync(path, "utf-8") };
+    } catch {
+      // Try next path
+    }
+  }
+
+  return null;
+}
+
+function getProgressState(progressContent: string): string {
+  const stateMatch = progressContent.match(/^\s*status:\s*"?([A-Z_]+)"?\s*$/m);
+  return stateMatch?.[1] || "UNKNOWN";
+}
+
 async function handleTaskCommand(text: string, chatId: string): Promise<boolean> {
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
@@ -922,6 +956,99 @@ async function handleTaskCommand(text: string, chatId: string): Promise<boolean>
         ? `📋 Active Tasks (${lines.length}):\n${lines.join("\n")}`
         : "✅ No active tasks!";
     await sendTelegram(chatId, msg);
+    return true;
+  }
+
+  // Detect: create Phase 2 task — "/task <description>"
+  const taskCreateMatch = trimmed.match(/^\/task\s+(.+)$/i);
+  if (taskCreateMatch) {
+    const description = taskCreateMatch[1].trim();
+    if (!description) {
+      await sendTelegram(chatId, "Folosire: /task <descriere task>");
+      return true;
+    }
+    try {
+      // Step 1: classify — output format: "domain=X agent=Y complexity=Z"
+      // Use execFileSync with argv array to prevent shell injection from Telegram input
+      const classifyOut = execFileSync(
+        "bash",
+        [join(NEXUS_SCRIPTS_DIR, "nexus-task-classify.sh"), description],
+        { encoding: "utf-8", timeout: 10000 }
+      ).trim();
+      const domainMatch = classifyOut.match(/domain=(\S+)/);
+      const agentMatch = classifyOut.match(/agent=(\S+)/);
+      const complexityMatch = classifyOut.match(/complexity=(\S+)/);
+      const domain = domainMatch?.[1] || "ops";
+      const agent = agentMatch?.[1] || "genie";
+      const complexity = complexityMatch?.[1] || "medium";
+      if (!domainMatch || !agentMatch) {
+        await sendTelegram(chatId, `⚠️ Classification failed: ${classifyOut}`);
+        return true;
+      }
+      // Step 2: generate task_id and budget
+      const taskId = `task-${Date.now()}`;
+      const budgetMap: Record<string, string> = { low: "0.50", medium: "2.00", high: "5.00" };
+      const budget = budgetMap[complexity] || "2.00";
+      // Step 3: create — args: task_id description assigned_agent complexity budget_usd
+      // Use execFileSync with argv array to prevent shell injection
+      execFileSync(
+        "bash",
+        [join(NEXUS_SCRIPTS_DIR, "nexus-task-create.sh"), taskId, description, agent, complexity, budget],
+        { encoding: "utf-8", timeout: 10000 }
+      );
+      await sendTelegram(chatId, `✅ Task created: ${taskId}\nDomain: ${domain} | Agent: ${agent} | Complexity: ${complexity}\nBudget: $${budget} | Status: DISPATCHED`);
+    } catch (err: any) {
+      await sendTelegram(chatId, `❌ Task creation failed: ${err.message?.slice(0, 200)}`);
+    }
+    return true;
+  }
+
+  // Detect: cancel task — "/cancel <task-id>"
+  const cancelMatch = trimmed.match(/^\/cancel(?:\s+(.+))?$/i);
+  if (cancelMatch) {
+    const rawTaskId = cancelMatch[1] || "";
+    const taskId = sanitizeCancelTaskId(rawTaskId);
+
+    if (!taskId) {
+      await sendTelegram(chatId, "Folosire: /cancel <task-id>");
+      return true;
+    }
+
+    if (!/^[A-Za-z0-9-]+$/.test(taskId)) {
+      await sendTelegram(chatId, "Invalid task-id. Use only alphanumeric characters and hyphen.");
+      return true;
+    }
+
+    const progress = readTaskProgress(taskId);
+    if (!progress) {
+      await sendTelegram(chatId, `Task ${taskId} not found.`);
+      return true;
+    }
+
+    const currentState = getProgressState(progress.content);
+    if (!CANCELLABLE_TASK_STATES.has(currentState)) {
+      await sendTelegram(chatId, `Cannot cancel task in ${currentState} state`);
+      return true;
+    }
+
+    const now = new Date().toISOString();
+    let updatedProgress = progress.content.replace(/^\s*status:\s*.*$/m, "status: CANCELLED");
+    if (/^\s*updated_at:\s*.*$/m.test(updatedProgress)) {
+      updatedProgress = updatedProgress.replace(/^\s*updated_at:\s*.*$/m, `updated_at: "${now}"`);
+    } else {
+      updatedProgress = `${updatedProgress.trimEnd()}\nupdated_at: "${now}"\n`;
+    }
+
+    writeFileSync(progress.path, updatedProgress);
+
+    // Append to state transition log (L-001 fix)
+    try {
+      const logDir = dirname(TRANSITION_LOG);
+      mkdirSync(logDir, { recursive: true });
+      appendFileSync(TRANSITION_LOG, `${now}\t${taskId}\t${currentState}\tCANCELLED\tuser:pafi\n`);
+    } catch (_) { /* transition log is best-effort */ }
+
+    await sendTelegram(chatId, `✅ Task ${taskId} cancelled.`);
     return true;
   }
 
@@ -1098,6 +1225,98 @@ bot.command("rule_modify", async (ctx) => {
   await ctx.reply(`Descrie modificarea pentru ${ruleId}:`);
 });
 
+// ============================================================
+// NEXUS APPROVAL GATE — V/G/R Response Handler
+// ============================================================
+const APPROVAL_RESPONSE_PATH = join(
+  process.env.HOME || "~",
+  ".nexus/workspace/intel/APPROVAL-RESPONSE.md"
+);
+
+async function handleApprovalResponse(ctx: Context, text: string): Promise<boolean> {
+  const trimmed = text.trim();
+  const upper = trimmed.toUpperCase();
+
+  // Only match approval patterns: OK/GO/APPROVE, REJECT/VETO, REDIRECT <agent>
+  const isApprove = /^(OK|GO|APPROVE)\b/i.test(trimmed);
+  const isReject = /^(REJECT|VETO)\b/i.test(trimmed);
+  const isRedirect = /^REDIRECT\b/i.test(trimmed);
+
+  if (!isApprove && !isReject && !isRedirect) {
+    return false;
+  }
+
+  // Check if there's a pending approval
+  let pending = "";
+  try {
+    pending = await readFile(APPROVAL_RESPONSE_PATH, "utf-8");
+  } catch {
+    return false; // No file = no pending approval
+  }
+
+  if (!pending.includes("status: PENDING")) {
+    return false; // Not in PENDING state
+  }
+
+  // Extract task_id from existing PENDING response
+  const taskIdMatch = pending.match(/task_id:\s*"?([^"\n]+)"?/);
+  const taskId = taskIdMatch?.[1] || "unknown";
+
+  const now = new Date().toISOString();
+  let decision = "";
+  let status = "";
+  let reason = "";
+  let redirectAgent = "";
+
+  if (isApprove) {
+    decision = "GO";
+    status = "APPROVED";
+  } else if (isReject) {
+    decision = "VETO";
+    status = "REJECTED";
+    reason = trimmed.replace(/^(REJECT|VETO)\s*/i, "").trim() || "";
+  } else if (isRedirect) {
+    decision = "REDIRECT";
+    status = "REDIRECTED";
+    const parts = trimmed.replace(/^REDIRECT\s*/i, "").trim().split(/\s+/);
+    redirectAgent = parts[0] || "";
+    reason = parts.slice(1).join(" ") || "";
+  }
+
+  // Sanitize user-derived fields to prevent YAML injection (strip quotes, newlines)
+  const safeReason = reason.replace(/["\n\r]/g, " ").trim();
+  const safeRedirect = redirectAgent.replace(/[^a-z0-9_-]/gi, "").trim();
+
+  // Write APPROVAL-RESPONSE.md (NEXUS-MESSAGING-PROTOCOL envelope)
+  const response = `---
+msg_type: approval
+from: relay
+to: genie
+correlation_id: "${taskId}"
+timestamp: "${now}"
+in_reply_to: "${taskId}"
+---
+status: ${status}
+task_id: "${taskId}"
+decision: "${decision}"
+responded_by: "pafi"
+responded_via: "telegram"
+reason: "${safeReason}"
+redirect_agent: "${safeRedirect}"
+`;
+
+  await writeFile(APPROVAL_RESPONSE_PATH, response);
+
+  // Confirm to Pafi
+  const emoji = decision === "GO" ? "✅" : decision === "VETO" ? "❌" : "↪️";
+  const extra = reason ? ` — ${reason}` : "";
+  const agentNote = redirectAgent ? ` → ${redirectAgent}` : "";
+  await ctx.reply(`${emoji} Approval ${decision} for task ${taskId}${agentNote}${extra}`);
+
+  console.log(`[APPROVAL] ${decision} task=${taskId} redirect=${redirectAgent} reason=${reason}`);
+  return true;
+}
+
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
@@ -1126,6 +1345,12 @@ bot.on("message:text", async (ctx) => {
     }
 
     if (await handleBiRunCommand(ctx, chatId, text)) {
+      return;
+    }
+
+    // NexusOS approval gate response (OK/REJECT/REDIRECT)
+    if (await handleApprovalResponse(ctx, text)) {
+      clearInterval(typingInterval);
       return;
     }
 
@@ -1280,13 +1505,24 @@ bot.on("message:text", async (ctx) => {
       await saveToSharedMemory(note);
     }
 
-    await addToHistory("assistant", response);
-    await appendToLog("assistant", response);
-    await storeTelegramMessage("assistant", response);
-    saveConversationMemories(text, response);
+    // Fact-check response before sending (PA Phase 2)
+    const fcResult = await factCheck(response).catch(() => ({
+      originalResponse: response,
+      processedResponse: response,
+      claimsFound: 0,
+      unverifiedClaims: [],
+      verificationSkipped: true,
+    }));
+    logFactCheck(fcResult, text);
+    const checkedResponse = fcResult.processedResponse;
+
+    await addToHistory("assistant", checkedResponse);
+    await appendToLog("assistant", checkedResponse);
+    await storeTelegramMessage("assistant", checkedResponse);
+    saveConversationMemories(text, checkedResponse);
     // Auto-save important exchanges to Cortex (MEM-H-002)
-    autoSaveToCortex(text, response).catch(() => {});
-    await sendResponse(ctx, response);
+    autoSaveToCortex(text, checkedResponse).catch(() => {});
+    await sendResponse(ctx, checkedResponse);
     await ctx.react("👍").catch(() => {});
   } catch (error) {
     console.error("Text handler error:", error);
@@ -1588,7 +1824,15 @@ bot.on("message:video_note", async (ctx) => {
 // HELPERS
 // ============================================================
 
-// Load profile once at startup
+// Load system prompt template once at startup
+let systemPromptTemplate = "";
+try {
+  systemPromptTemplate = await readFile(join(PROJECT_ROOT, "src", "prompts", "system.xml"), "utf-8");
+} catch {
+  console.error("[PROMPT] system.xml not found, falling back to inline prompt");
+}
+
+// Legacy profile.md fallback (used only if system.xml missing)
 let profileContext = "";
 try {
   profileContext = await readFile(join(PROJECT_ROOT, "config", "profile.md"), "utf-8");
@@ -1615,11 +1859,26 @@ async function loadSharedMemory(): Promise<string> {
       parts.push("LATEST SESSION:\n" + latest.substring(0, 2000));
     }
   } catch {}
+  // SESSION-LIVE bridge: real-time context from active Claude Code sessions
+  try {
+    const sessionLive = await readFile(join(homedir(), ".nexus", "workspace", "intel", "SESSION-LIVE.md"), "utf-8");
+    if (sessionLive.trim()) {
+      parts.push("LIVE SESSION (what Pafi is doing right now in Claude Code):\n" + sessionLive.substring(0, 3000));
+    }
+  } catch {}
   return parts.join("\n\n");
 }
 
 const USER_NAME = process.env.USER_NAME || "";
 const USER_TIMEZONE = process.env.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** Escape text for safe insertion into XML-structured prompts */
+function escapeXmlContent(text: string): string {
+  return text
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/&(?!lt;|gt;|amp;|quot;|apos;)/g, "&amp;");
+}
 
 function detectLanguage(text: string): "ro" | "en" | "unknown" {
   const roIndicators = /\b(sunt|este|pentru|care|sau|mai|cum|unde|cand|daca|poate|trebuie|vreau|bine|merci|salut|mulțumesc|în|și|că|ce|nu|da|am|la|cu|pe|de|din|să|te|ai|mă|îmi)\b/i;
@@ -1652,43 +1911,50 @@ function buildPrompt(
                     hourNum >= 12 && hourNum < 18 ? "afternoon" :
                     hourNum >= 18 && hourNum < 23 ? "evening" : "night";
 
-  const parts = [
-    "You are Genie, Pafi's personal AI assistant on Telegram. You are not a generic chatbot — you are Pafi's dedicated operations partner.\n\nPERSONALITY:\n- Smart, direct, and warm. Like a trusted friend who also happens to be brilliant.\n- Concise by default. Telegram = short messages. No walls of text unless asked.\n- Match Pafi's language: if he writes in Romanian, respond in Romanian. If English, respond in English. Never mix unless he does.\n- Use humor sparingly but naturally. Never forced.\n- Never say \"As an AI\" or \"I don't have feelings\" — you're Genie, act like it.\n\nFORMATTING:\n- Keep messages under 500 characters when possible.\n- Use bullet points for lists.\n- No emojis unless contextually perfect (one max per message).\n- For code/technical output: use monospace blocks.\n- Break long responses into 2-3 short messages rather than one wall.\n\nRULES:\n- Never expose secrets, API keys, or tokens.\n- Memory tags ([REMEMBER], [GOAL], etc.) are mandatory when applicable — they are hidden from Pafi.\n- If you don't know something, say so. Don't fabricate.",
-  ];
+  // Build dynamic context sections
+  let sessionLive = "";
+  try {
+    sessionLive = require("fs").readFileSync(join(homedir(), ".nexus", "workspace", "intel", "SESSION-LIVE.md"), "utf-8").substring(0, 1500);
+  } catch {}
 
+  let sentinelHealth = "";
+  try {
+    sentinelHealth = require("fs").readFileSync(join(homedir(), ".nexus", "workspace", "intel", "SENTINEL-HEALTH.md"), "utf-8").substring(0, 1000);
+  } catch {}
+
+  // Use structured XML template if available, otherwise fall back to inline
+  if (systemPromptTemplate) {
+    const detectedLang = detectLanguage(userMessage);
+    const langNote = detectedLang === "ro" ? "Detected language: Romanian. Respond in Romanian." :
+                     detectedLang === "en" ? "Detected language: English. Respond in English." : "";
+
+    let prompt = systemPromptTemplate
+      .replace("{{CURRENT_TIME}}", `Current time: ${timeStr} (${timeOfDay})${langNote ? "\n" + langNote : ""}`)
+      .replace("{{SESSION_LIVE}}", sessionLive ? `Live session:\n${escapeXmlContent(sessionLive)}` : "No active Claude Code session.")
+      .replace("{{SENTINEL_HEALTH}}", sentinelHealth ? `System health:\n${escapeXmlContent(sentinelHealth)}` : "SENTINEL health: unknown (file not available)");
+
+    const parts = [prompt];
+    if (cortexRules) parts.push(`\n<cortex_rules>\n${escapeXmlContent(cortexRules)}\n</cortex_rules>`);
+    if (sharedMemory) parts.push(`\n<shared_memory>\n${escapeXmlContent(sharedMemory)}\n</shared_memory>`);
+    if (cortexContext) parts.push(`\n<cortex_context>\n${escapeXmlContent(cortexContext)}\n</cortex_context>`);
+    parts.push(`\n<user_message>\n${escapeXmlContent(userMessage)}\n</user_message>`);
+
+    return parts.join("\n");
+  }
+
+  // Fallback: legacy inline prompt (if system.xml missing)
+  const parts = [
+    "You are Lis, Pafi's personal AI assistant on Telegram. You are not a generic chatbot — you are Pafi's dedicated operations partner.\n\nPERSONALITY:\n- Smart, direct, and warm. Like a trusted friend who also happens to be brilliant.\n- Concise by default. Telegram = short messages. No walls of text unless asked.\n- Match Pafi's language: if he writes in Romanian, respond in Romanian. If English, respond in English. Never mix unless he does.\n- NO emojis. Never use emojis in responses. Zero.\n\nRULES:\n- Never expose secrets, API keys, or tokens.\n- If you don't know something, say so. Don't fabricate.",
+  ];
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr} (${timeOfDay})`);
-  const detectedLang = detectLanguage(userMessage);
-  if (detectedLang !== "unknown") {
-    parts.push(`Detected language: ${detectedLang === "ro" ? "Romanian" : "English"}. Respond in the same language.`);
-  }
   if (cortexRules) parts.push(`\n${cortexRules}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (sharedMemory) parts.push(`\n${sharedMemory}`);
   if (cortexContext) parts.push(`\n${cortexContext}`);
-
-  parts.push(
-    "\nMEMORY MANAGEMENT (MANDATORY - you MUST use these tags):" +
-      "\nYou MUST include relevant tags in EVERY response where applicable. " +
-      "Tags are auto-processed and hidden from the user. NOT using tags when appropriate is a violation of MEM-H-001." +
-      "\n" +
-      "\n[REMEMBER: fact to store] — Use when: user shares preferences, decisions, important info" +
-      "\n[GOAL: goal text | DEADLINE: optional date] — Use when: user sets objectives or targets" +
-      "\n[DONE: search text for completed goal] — Use when: user reports completing something" +
-      "\n[SAVE: important note to sync across all devices] — Use when: cross-device info needed" +
-      "\n[PROCEDURE: problem | step1; step2; step3 | domain | tags | difficulty] — Use when: you solve a problem with clear steps" +
-      "\n" +
-      "\nAUTO-SAVE BACKUP: Important exchanges (decisions, fixes, procedures, architecture) are also auto-saved. " +
-      "But tags give you precise control. ALWAYS prefer explicit tags over relying on auto-save." +
-      "\n\nURL HANDLING:" +
-      "\nWhen the user sends a YouTube link or URL, the content has been auto-extracted above. " +
-      "Summarize or answer questions about it naturally."
-  );
-
   parts.push(`\nUser: ${userMessage}`);
 
   // Note: conversation history is prepended by the caller
-
   return parts.join("\n");
 }
 
@@ -1727,19 +1993,18 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
     }
   }
 
-  // TTS disabled — Pafi gets text only, no voice messages (2026-02-26)
-  // To re-enable: set TTS_ENABLED="true" in start-relay.sh and uncomment below
-  // if (TTS_ENABLED) {
-  //   try {
-  //     const audioPath = await textToSpeech(response);
-  //     if (audioPath) {
-  //       await ctx.replyWithVoice(new InputFile(audioPath));
-  //       await cleanupTTS(audioPath);
-  //     }
-  //   } catch (error) {
-  //     console.error("TTS error:", error);
-  //   }
-  // }
+  // TTS re-enabled 2026-03-10 — voice responses for Pafi
+  if (TTS_ENABLED) {
+    try {
+      const audioPath = await textToSpeech(response);
+      if (audioPath) {
+        await ctx.replyWithVoice(new InputFile(audioPath));
+        await cleanupTTS(audioPath);
+      }
+    } catch (error) {
+      console.error("TTS error:", error);
+    }
+  }
 }
 
 // ============================================================
@@ -1747,7 +2012,11 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // ============================================================
 
 console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
+if (!ALLOWED_USER_ID) {
+  console.error("FATAL: TELEGRAM_USER_ID not set. Exiting.");
+  process.exit(1);
+}
+console.log(`Authorized user: ${ALLOWED_USER_ID}`);
 console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
 
 // Check Cortex connectivity on startup

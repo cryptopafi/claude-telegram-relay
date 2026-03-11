@@ -7,10 +7,148 @@ const DEFAULT_DB_PATH = process.env.MEMORY_DB_PATH || join(DEFAULT_RELAY_DIR, "m
 const PRUNE_THRESHOLD = 0.1;
 const SEMANTIC_HALF_LIFE_DAYS = 110;
 const EPISODIC_HALF_LIFE_DAYS = 7;
+const MAX_HALF_LIFE = 365;
+const MAX_SALIENCE = 3.0;
 const MAX_MEMORIES = 5000;
 
 export const SEMANTIC_TRIGGER_RE =
-  /(?:^|[^\p{L}])(prefer|always|never|remember|I am|I'm|my name|I like|I don't|I do|I want|I need)(?:$|[^\p{L}])|(?:^|[^\p{L}])(prefer|mereu|niciodată|îmi place|nu îmi|ține minte|țin minte|eu sunt|vreau să|am nevoie|nu vreau|îmi trebuie|obișnuiesc)(?:$|[^\p{L}])/iu;
+  /(?:^|[^\p{L}])(prefer|always|never|remember|I am|I'm|my name|I like|I don't|I do|I want|I need)(?:$|[^\p{L}])|(?:^|[^\p{L}])(prefer|mereu|niciodată|îmi place|nu îmi|ține minte|țin minte|eu sunt|vreau să|am nevoie|nu vreau|îmi trebuie|obișnuiesc|folosesc|am setat|am configurat|am decis|lucr[aă]m cu|contul|proiectul|echipa|agentul|regula|prefer[aă]|nu mai|de acum|dintotdeauna)(?:$|[^\p{L}])/iu;
+
+const STOPWORDS = new Set(
+  [
+    // EN (50)
+    "the",
+    "is",
+    "and",
+    "a",
+    "to",
+    "in",
+    "of",
+    "for",
+    "on",
+    "at",
+    "with",
+    "from",
+    "by",
+    "it",
+    "this",
+    "that",
+    "these",
+    "those",
+    "be",
+    "are",
+    "was",
+    "were",
+    "as",
+    "or",
+    "an",
+    "if",
+    "then",
+    "than",
+    "but",
+    "not",
+    "no",
+    "yes",
+    "do",
+    "does",
+    "did",
+    "done",
+    "have",
+    "has",
+    "had",
+    "i",
+    "you",
+    "he",
+    "she",
+    "we",
+    "they",
+    "me",
+    "my",
+    "your",
+    "our",
+    "their",
+    // RO (50)
+    "și",
+    "si",
+    "este",
+    "sunt",
+    "am",
+    "ai",
+    "are",
+    "avem",
+    "aveti",
+    "aveți",
+    "au",
+    "un",
+    "o",
+    "una",
+    "unui",
+    "unei",
+    "de",
+    "la",
+    "cu",
+    "pe",
+    "pentru",
+    "din",
+    "care",
+    "ce",
+    "ca",
+    "nu",
+    "da",
+    "în",
+    "in",
+    "prin",
+    "asupra",
+    "după",
+    "dupa",
+    "dacă",
+    "daca",
+    "sau",
+    "ori",
+    "nici",
+    "doar",
+    "mai",
+    "foarte",
+    "eu",
+    "tu",
+    "el",
+    "ea",
+    "noi",
+    "voi",
+    "ei",
+    "ele",
+    "lor",
+    "meu",
+  ].map((w) => w.toLowerCase())
+);
+
+const KNOWN_ENTITIES = new Map<string, RegExp>([
+  ["Codex", /\bcodex\b/i],
+  ["FORGE", /\bforge\b/i],
+  ["SENTINEL", /\bsentinel\b/i],
+  ["IRIS", /\biris\b/i],
+  ["Delphi", /\bdelphi\b/i],
+  ["ECHELON", /\bechelon\b/i],
+  ["RADAR", /\bradar\b/i],
+  ["Gmail", /\bgmail\b/i],
+  ["Notion", /\bnotion\b/i],
+  ["Cortex", /\bcortex\b/i],
+  ["Albastru", /\balbastru\b/i],
+  ["SMSads", /\bsmsads\b/i],
+  ["Clickwin", /\bclickwin\b/i],
+  ["OpenClaw", /\bopenclaw\b/i],
+  ["Solnest", /\bsolnest\b/i],
+]);
+
+const TOPIC_KEYWORDS: Array<[RegExp, string]> = [
+  [/\bdeploy/i, "deployment"],
+  [/\bfix(?:ed|ing|es)?\b/i, "bugfix"],
+  [/\baudit/i, "quality"],
+  [/\btriage/i, "email"],
+  [/\bpipeline/i, "pipeline"],
+  [/\bresearch/i, "research"],
+  [/\bschedul/i, "calendar"],
+];
 
 export interface MemoryDBContext {
   db: Database;
@@ -22,7 +160,7 @@ export function computeSalience(salience: number, halfLifeDays: number, createdA
   return salience * Math.exp((-daysElapsed * Math.LN2) / Math.max(halfLifeDays, 0.01));
 }
 
-export function initMemoryDB(dbPath = DEFAULT_DB_PATH): MemoryDBContext {
+export function initMemoryDB(dbPath = DEFAULT_DB_PATH, { skipSession = false } = {}): MemoryDBContext {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath, { create: true, strict: true });
 
@@ -65,11 +203,33 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH): MemoryDBContext {
     );
   `);
 
-  const sessionId = Date.now().toString();
-  db.query(
-    `INSERT OR IGNORE INTO sessions (id, started_at, last_message_at, message_count)
-     VALUES (?1, unixepoch(), unixepoch(), 0)`
-  ).run(sessionId);
+  const existingColumns = new Set(
+    (db.query("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map((row) => row.name)
+  );
+  if (!existingColumns.has("topic")) {
+    db.exec("ALTER TABLE memories ADD COLUMN topic TEXT DEFAULT NULL;");
+  }
+  if (!existingColumns.has("entity")) {
+    db.exec("ALTER TABLE memories ADD COLUMN entity TEXT DEFAULT NULL;");
+  }
+  if (!existingColumns.has("consolidated_from")) {
+    db.exec("ALTER TABLE memories ADD COLUMN consolidated_from TEXT DEFAULT NULL;");
+  }
+  if (!existingColumns.has("cortex_id")) {
+    db.exec("ALTER TABLE memories ADD COLUMN cortex_id TEXT DEFAULT NULL;");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity);");
+  db.exec("PRAGMA journal_mode=WAL;");
+
+  let sessionId = "maintenance";
+  if (!skipSession) {
+    sessionId = Date.now().toString();
+    db.query(
+      `INSERT OR IGNORE INTO sessions (id, started_at, last_message_at, message_count)
+       VALUES (?1, unixepoch(), unixepoch(), 0)`
+    ).run(sessionId);
+  }
 
   return { db, sessionId };
 }
@@ -89,8 +249,11 @@ export function reinforceSalience(db: Database, memoryId: number): void {
     .get(memoryId) as { salience: number; half_life_days: number } | null;
   if (!row) return;
 
-  const nextSalience = Math.min(5.0, Number(row.salience || 0) + 0.1);
-  const nextHalfLife = Math.max(0.5, Number(row.half_life_days || EPISODIC_HALF_LIFE_DAYS) * 1.15);
+  const nextSalience = Math.min(MAX_SALIENCE, Number(row.salience || 0) + 0.1);
+  const nextHalfLife = Math.min(
+    MAX_HALF_LIFE,
+    Math.max(0.5, Number(row.half_life_days || EPISODIC_HALF_LIFE_DAYS) * 1.15)
+  );
 
   db.query(
     `UPDATE memories
@@ -147,13 +310,26 @@ export function pruneExpired(db: Database): number {
 }
 
 function tokenizeForFts(text: string): string {
-  return text
+  const tokens = text
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/[^a-zăîâșțşţ0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((x) => x.length >= 2)
-    .slice(0, 8)
-    .join(" OR ");
+    .filter((x) => x.length >= 2 && !STOPWORDS.has(x));
+  return tokens.slice(0, 10).join(" OR ");
+}
+
+function detectEntity(text: string): string | null {
+  for (const [entity, re] of KNOWN_ENTITIES) {
+    if (re.test(text)) return entity;
+  }
+  return null;
+}
+
+function detectTopic(text: string): string | null {
+  for (const [re, topic] of TOPIC_KEYWORDS) {
+    if (re.test(text)) return topic;
+  }
+  return null;
 }
 
 export function getMemoryContext(db: Database, userMessage: string): string {
@@ -202,10 +378,12 @@ function saveMemory(db: Database, text: string, type: "semantic" | "episodic"): 
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return;
   const halfLife = type === "semantic" ? SEMANTIC_HALF_LIFE_DAYS : EPISODIC_HALF_LIFE_DAYS;
+  const entity = detectEntity(cleaned);
+  const topic = detectTopic(cleaned);
   db.query(
-    `INSERT INTO memories (text, type, salience, half_life_days, created_at, last_accessed_at, access_count)
-     VALUES (?1, ?2, 1.0, ?3, unixepoch(), unixepoch(), 0)`
-  ).run(cleaned.slice(0, 800), type, halfLife);
+    `INSERT INTO memories (text, type, salience, half_life_days, created_at, last_accessed_at, access_count, topic, entity)
+     VALUES (?1, ?2, 1.0, ?3, unixepoch(), unixepoch(), 0, ?4, ?5)`
+  ).run(cleaned.slice(0, 800), type, halfLife, topic, entity);
 }
 
 function pickSemanticSentence(userMessage: string): string | null {
@@ -240,7 +418,17 @@ export function extractAndSaveMemories(
 }
 
 export function runMaintenance(dbPath = DEFAULT_DB_PATH): { pruned: number; total: number; dbPath: string } {
-  const { db } = initMemoryDB(dbPath);
+  const { db } = initMemoryDB(dbPath, { skipSession: true });
+  db.exec(
+    `UPDATE memories
+     SET half_life_days = MIN(half_life_days, ${MAX_HALF_LIFE})
+     WHERE half_life_days > ${MAX_HALF_LIFE};`
+  );
+  db.exec(
+    `UPDATE memories
+     SET salience = MIN(salience, ${MAX_SALIENCE})
+     WHERE salience > ${MAX_SALIENCE};`
+  );
   const pruned = pruneExpired(db);
   db.exec("VACUUM;");
   const row = db.query("SELECT COUNT(*) AS total FROM memories").get() as { total: number } | null;
