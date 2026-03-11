@@ -3,6 +3,7 @@ import { join } from "path";
 import { appendFile, open, stat } from "fs/promises";
 import { createHash } from "crypto";
 import { isDuplicate, markProcessed } from "./dispatch-dedup";
+import { isEnabled } from "./feature-flags";
 
 export enum TaskType {
   CODE = "code",
@@ -39,6 +40,8 @@ type DispatchContext = {
 };
 
 type AdapterFn = (context: DispatchContext) => Promise<DispatchResult>;
+
+type AdapterMap = Partial<Record<Exclude<TaskType, TaskType.GENERAL>, AdapterFn>>;
 
 type PatternRule = {
   name: string;
@@ -467,9 +470,13 @@ const ADAPTER_BY_TYPE: Record<Exclude<TaskType, TaskType.GENERAL>, AdapterFn> = 
   [TaskType.AUDIT]: forgeAdapter,
 };
 
-export function initDispatch(bot: unknown, sendMessage: SendMessageFn) {
+export function initDispatch(bot: unknown, sendMessage: SendMessageFn, adapters: AdapterMap = {}) {
   return {
     async handle(text: string, chatId: string): Promise<DispatchResult> {
+      if (!isEnabled("FEATURE_SMART_DISPATCH")) {
+        return NOT_HANDLED;
+      }
+
       const classification = classifyMessage(text);
 
       if (
@@ -487,7 +494,7 @@ export function initDispatch(bot: unknown, sendMessage: SendMessageFn) {
         };
       }
 
-      const adapter = ADAPTER_BY_TYPE[classification.type];
+      const adapter = adapters[classification.type] || ADAPTER_BY_TYPE[classification.type];
       if (!adapter) return NOT_HANDLED;
 
       const result = await adapter({

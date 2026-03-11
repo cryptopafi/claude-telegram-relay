@@ -46,6 +46,10 @@ function refreshIfStale(): void {
   }
 }
 
+export function __refreshFlagsForTests(): void {
+  refreshFlags();
+}
+
 export function isEnabled(flag: string): boolean {
   refreshIfStale();
   if (!FLAG_NAMES.includes(flag as FlagName)) {
