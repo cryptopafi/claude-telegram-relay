@@ -78,6 +78,7 @@ const POLL_INTERVAL_MS = 4000;
 const POLL_TIMEOUT_MS = 30 * 60 * 1000;
 const NEXUS_POLL_INTERVAL_MS = 5000;
 const NEXUS_CREATE_TIMEOUT_MS = 10_000;
+const MAX_READ_CHUNK_BYTES = 64 * 1024;
 
 const ROUTING_TIMEOUT_DEFAULTS: Record<RoutingDomain, number> = {
   research: 2700,
@@ -175,21 +176,23 @@ const ROUTING_PATTERNS: Record<Exclude<TaskType, TaskType.GENERAL>, PatternRule[
 
 type PollerState = {
   offset: number;
-  interval: ReturnType<typeof setInterval>;
+  timer: ReturnType<typeof setTimeout> | null;
   expiresAt: number;
   lastDeliveryFingerprint: string;
   taskId: string;
+  isTickRunning: boolean;
 };
 
 const codexPollers = new Map<string, PollerState>();
 
 type NexusPollerState = {
-  interval: ReturnType<typeof setInterval>;
+  timer: ReturnType<typeof setTimeout> | null;
   expiresAt: number;
   lastStatus: string;
   chatId: string;
   sendMessage: SendMessageFn;
   route: NexusRouteConfig;
+  isTickRunning: boolean;
 };
 
 const nexusPollers = new Map<string, NexusPollerState>();
@@ -345,11 +348,11 @@ async function readChunkFromOffset(path: string, offset: number): Promise<{ next
       return { nextOffset: fileStat.size, chunk: "" };
     }
 
-    const bytesToRead = fileStat.size - offset;
+    const bytesToRead = Math.min(fileStat.size - offset, MAX_READ_CHUNK_BYTES);
     const buffer = Buffer.alloc(bytesToRead);
     await handle.read(buffer, 0, bytesToRead, offset);
     return {
-      nextOffset: fileStat.size,
+      nextOffset: offset + bytesToRead,
       chunk: buffer.toString("utf-8"),
     };
   } catch {
@@ -359,46 +362,46 @@ async function readChunkFromOffset(path: string, offset: number): Promise<{ next
   }
 }
 
-function pickDeliveryLine(chunk: string): string {
+function pickDeliveryLines(chunk: string): string[] {
   const lines = chunk
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
 
+  if (lines.length === 0) return [];
+
   // Priority 1: lines with explicit task IDs (best for taskId filtering)
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index];
-    if (/\[(m4-\d+|codex-task-[^\]]+|SYNC)/i.test(line)) return line;
-  }
+  const explicitIdLines = lines.filter((line) => /\[(m4-\d+|codex-task-[^\]]+|SYNC)/i.test(line));
+  if (explicitIdLines.length > 0) return explicitIdLines;
 
   // Priority 2: ## headers (e.g., "## Delivery m4-442: P5-BATCH-D")
-  const header = lines.find((line) => /^##\s+/i.test(line));
-  if (header) return header;
+  const headers = lines.filter((line) => /^##\s+/i.test(line));
+  if (headers.length > 0) return headers;
 
-  // Priority 3: status lines (DONE/BLOCKED/ERROR) — last resort
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index];
-    if (/\b(DONE|BLOCKED|ERROR)\b/i.test(line)) return line;
-  }
+  // Priority 3: status lines (DONE/BLOCKED/ERROR)
+  const statusLines = lines.filter((line) => /\b(DONE|BLOCKED|ERROR)\b/i.test(line));
+  if (statusLines.length > 0) return statusLines;
 
-  return lines.at(-1) ?? "";
+  return [lines.at(-1) ?? ""].filter(Boolean);
 }
 
 function contentFingerprint(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function stopCodexPoller(chatId: string): void {
-  const poller = codexPollers.get(chatId);
+function stopCodexPoller(taskId: string): void {
+  const poller = codexPollers.get(taskId);
   if (!poller) return;
-  clearInterval(poller.interval);
-  codexPollers.delete(chatId);
+  if (poller.timer) clearTimeout(poller.timer);
+  poller.timer = null;
+  codexPollers.delete(taskId);
 }
 
 function stopNexusPoller(taskId: string): void {
   const poller = nexusPollers.get(taskId);
   if (!poller) return;
-  clearInterval(poller.interval);
+  if (poller.timer) clearTimeout(poller.timer);
+  poller.timer = null;
   nexusPollers.delete(taskId);
 }
 
@@ -505,51 +508,63 @@ async function startNexusPoller(
   if (!taskId || !chatId || nexusPollers.has(taskId)) return;
 
   const state: NexusPollerState = {
-    interval: setInterval(() => {}),
+    timer: null,
     expiresAt: Date.now() + timeoutMs,
     lastStatus: "",
     chatId,
     sendMessage,
     route,
+    isTickRunning: false,
+  };
+
+  const scheduleNextTick = (): void => {
+    if (!nexusPollers.has(taskId)) return;
+    state.timer = setTimeout(() => {
+      void tick();
+    }, NEXUS_POLL_INTERVAL_MS);
+    if (typeof (state.timer as any)?.unref === "function") {
+      (state.timer as any).unref();
+    }
   };
 
   const tick = async (): Promise<void> => {
-    if (Date.now() > state.expiresAt) {
+    if (state.isTickRunning || !nexusPollers.has(taskId)) return;
+    state.isTickRunning = true;
+    try {
+      if (Date.now() > state.expiresAt) {
+        stopNexusPoller(taskId);
+        await state.sendMessage(state.chatId, `Nexus task ${taskId} timed out while waiting for completion.`).catch(
+          () => {}
+        );
+        return;
+      }
+
+      const progress = await readNexusProgress(taskId);
+      if (!progress) return;
+      if (progress.status === state.lastStatus) return;
+      state.lastStatus = progress.status;
+
+      if (progress.status !== "DONE" && progress.status !== "FAILED") return;
+
+      const outputSuffix = progress.outputLocation ? ` Output: ${progress.outputLocation}` : "";
+      const prefix = progress.status === "DONE" ? "✅" : "❌";
+      await state
+        .sendMessage(
+          state.chatId,
+          `${prefix} Nexus task ${taskId} (${state.route.agent}) finished with status ${progress.status}.${outputSuffix}`
+        )
+        .catch(() => {});
       stopNexusPoller(taskId);
-      await state.sendMessage(state.chatId, `Nexus task ${taskId} timed out while waiting for completion.`).catch(
-        () => {}
-      );
-      return;
+    } finally {
+      state.isTickRunning = false;
+      if (nexusPollers.has(taskId)) {
+        scheduleNextTick();
+      }
     }
-
-    const progress = await readNexusProgress(taskId);
-    if (!progress) return;
-    if (progress.status === state.lastStatus) return;
-    state.lastStatus = progress.status;
-
-    if (progress.status !== "DONE" && progress.status !== "FAILED") return;
-
-    const outputSuffix = progress.outputLocation ? ` Output: ${progress.outputLocation}` : "";
-    const prefix = progress.status === "DONE" ? "✅" : "❌";
-    await state
-      .sendMessage(
-        state.chatId,
-        `${prefix} Nexus task ${taskId} (${state.route.agent}) finished with status ${progress.status}.${outputSuffix}`
-      )
-      .catch(() => {});
-    stopNexusPoller(taskId);
   };
 
-  state.interval = setInterval(() => {
-    void tick();
-  }, NEXUS_POLL_INTERVAL_MS);
-
-  if (typeof (state.interval as any).unref === "function") {
-    (state.interval as any).unref();
-  }
-
   nexusPollers.set(taskId, state);
-  await tick();
+  void tick();
 }
 
 async function dispatchToAgent(context: DispatchContext, taskType: NexusTaskType): Promise<DispatchResult> {
@@ -591,50 +606,65 @@ async function dispatchToAgent(context: DispatchContext, taskType: NexusTaskType
 }
 
 async function startCodexPoller(chatId: string, sendMessage: SendMessageFn, taskId: string): Promise<void> {
-  if (!chatId || codexPollers.has(chatId)) return;
+  if (!chatId || !taskId || codexPollers.has(taskId)) return;
 
   const initialOffset = await getFileSize(CODEX_DELIVERY_PATH);
   const state: PollerState = {
     offset: initialOffset,
-    interval: setInterval(() => {}),
+    timer: null,
     expiresAt: Date.now() + POLL_TIMEOUT_MS,
     lastDeliveryFingerprint: "",
     taskId,
+    isTickRunning: false,
+  };
+
+  const scheduleNextTick = (): void => {
+    if (!codexPollers.has(taskId)) return;
+    state.timer = setTimeout(() => {
+      void tick();
+    }, POLL_INTERVAL_MS);
+    if (typeof (state.timer as any)?.unref === "function") {
+      (state.timer as any).unref();
+    }
   };
 
   const tick = async (): Promise<void> => {
-    if (Date.now() > state.expiresAt) {
-      stopCodexPoller(chatId);
-      return;
+    if (state.isTickRunning || !codexPollers.has(taskId)) return;
+    state.isTickRunning = true;
+    try {
+      if (Date.now() > state.expiresAt) {
+        stopCodexPoller(taskId);
+        return;
+      }
+
+      const { nextOffset, chunk } = await readChunkFromOffset(CODEX_DELIVERY_PATH, state.offset);
+      state.offset = nextOffset;
+      if (!chunk.trim()) return;
+
+      const deliveryLines = pickDeliveryLines(chunk);
+      if (deliveryLines.length === 0) return;
+
+      for (const deliveryLine of deliveryLines) {
+        // Only forward lines that match this task's ID
+        if (state.taskId && !deliveryLine.includes(state.taskId)) continue;
+
+        const fingerprint = contentFingerprint(deliveryLine);
+        if (fingerprint === state.lastDeliveryFingerprint) continue;
+        state.lastDeliveryFingerprint = fingerprint;
+
+        const safeLine = deliveryLine.slice(0, 360);
+        await sendMessage(chatId, `Codex update: ${safeLine}`).catch(() => {});
+      }
+    } finally {
+      state.isTickRunning = false;
+      if (codexPollers.has(taskId)) {
+        scheduleNextTick();
+      }
     }
-
-    const { nextOffset, chunk } = await readChunkFromOffset(CODEX_DELIVERY_PATH, state.offset);
-    state.offset = nextOffset;
-    if (!chunk.trim()) return;
-
-    const deliveryLine = pickDeliveryLine(chunk);
-    if (!deliveryLine) return;
-
-    // Only forward lines that match this task's ID
-    if (state.taskId && !deliveryLine.includes(state.taskId)) return;
-
-    const fingerprint = contentFingerprint(deliveryLine);
-    if (fingerprint === state.lastDeliveryFingerprint) return;
-    state.lastDeliveryFingerprint = fingerprint;
-
-    const safeLine = deliveryLine.slice(0, 360);
-    await sendMessage(chatId, `Codex update: ${safeLine}`).catch(() => {});
   };
 
-  state.interval = setInterval(() => {
-    void tick();
-  }, POLL_INTERVAL_MS);
-
-  if (typeof (state.interval as any).unref === "function") {
-    (state.interval as any).unref();
-  }
-
-  codexPollers.set(chatId, state);
+  codexPollers.set(taskId, state);
+  void tick();
 }
 
 export async function codexAdapter(context: DispatchContext): Promise<DispatchResult> {
