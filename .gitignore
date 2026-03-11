@@ -19,6 +19,7 @@ logs/
 temp/
 uploads/
 session.json
+tests/golden/.telemetry.jsonl
 
 # OS
 .DS_Store
