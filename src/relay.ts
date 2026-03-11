@@ -50,6 +50,7 @@ import {
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
 import { activateLuna, deactivateLuna, isLunaActive, resetLuna, sendToLuna, setLunaModel, getLunaModel } from "./luna";
+import { readTrainingAsset } from "./luna-training";
 import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -1396,6 +1397,20 @@ bot.on("message:text", async (ctx) => {
   }
   if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
     try {
+      if (text.startsWith("/story:")) {
+        const storyText = text.slice(7).trim();
+        if (!storyText) {
+          await ctx.reply("Trimite `/story: [text]` cu povestea pe care vrei s-o analizeze Luna.");
+          return;
+        }
+
+        const protocol = readTrainingAsset("story-protocol.txt");
+        const storyPrompt = protocol ? `${protocol}\n\n[STORY TO ANALYZE]\n${storyText}` : storyText;
+        const storyResponse = await sendToLuna(lunaChatId, storyPrompt);
+        await sendResponse(ctx, storyResponse);
+        return;
+      }
+
       const lunaResponse = await sendToLuna(lunaChatId, text);
       await sendResponse(ctx, lunaResponse);
     } catch (error) {

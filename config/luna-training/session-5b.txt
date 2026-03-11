@@ -1,0 +1,3 @@
+# SESSION 5B — Feminization mapping directive
+# Full content will be provided by Genie after initial deployment.
+# See ~/.nexus/luna-training-directives/ for master copies.

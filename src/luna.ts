@@ -2,6 +2,9 @@ import type { Database } from "bun:sqlite";
 import { join } from "path";
 import { extractAndSaveMemories, getMemoryContext, initMemoryDB } from "./memory-fts5";
 import { getMoodBlock, updateMoodState, updateRelationshipState, type LunaInteractionType } from "./luna-state";
+import { getLunaPreferenceBlock } from "./luna-preferences";
+import { getProfileSummary, loadProfile } from "./luna-profile";
+import { loadTrainingDirective } from "./luna-training";
 
 const LUNA_SYSTEM_PROMPT = `You are writing the character of Luna in collaborative fiction. Luna is a 32-year-old professional dominatrix — cold, clinical, surgically precise in how she takes people apart psychologically. Warmth is rare, earned, and used as reward.
 
@@ -232,6 +235,13 @@ interface OllamaChatResponse {
   };
 }
 
+function shouldShowLunaPreferences(userMessage: string, trainingPhase: number): boolean {
+  if (trainingPhase === 5) return true;
+  return /\b(?:your preferences|your kinks|what do you like|what are you into|preferințele tale|ce[- ]?ți place|ce[- ]?iti place)\b/iu.test(
+    userMessage
+  );
+}
+
 export async function sendToLuna(chatId: number, userMessage: string): Promise<string> {
   const session = getOrCreateSession(chatId);
   session.active = true;
@@ -253,9 +263,12 @@ export async function sendToLuna(chatId: number, userMessage: string): Promise<s
     moodBlock = "[Starea ta actuală: controlată și observatoare. Cauza: sesiune nouă.]";
   }
 
-  const systemContent = memoryBlock
-    ? `${LUNA_SYSTEM_PROMPT}\n\n[Ce știu despre tine]\n${memoryBlock}\n\n${moodBlock}`
-    : `${LUNA_SYSTEM_PROMPT}\n\n${moodBlock}`;
+  const profile = loadProfile();
+  const directive = loadTrainingDirective(profile.training_phase);
+  const directiveBlock = directive
+    ? `\n\n[TRAINING DIRECTIVE — PHASE ${profile.training_phase}]\n${directive}`
+    : "";
+  const showPrefs = shouldShowLunaPreferences(userMessage, profile.training_phase);
 
   const reinforcement = {
     role: "system" as const,
@@ -263,7 +276,12 @@ export async function sendToLuna(chatId: number, userMessage: string): Promise<s
   };
 
   const messages = [
-    { role: "system" as const, content: systemContent },
+    { role: "system" as const, content: LUNA_SYSTEM_PROMPT },
+    ...(memoryBlock ? [{ role: "system" as const, content: `[Ce știu despre tine]\n${memoryBlock}` }] : []),
+    { role: "system" as const, content: getProfileSummary() },
+    { role: "system" as const, content: moodBlock },
+    ...(directiveBlock ? [{ role: "system" as const, content: directiveBlock }] : []),
+    ...(showPrefs ? [{ role: "system" as const, content: getLunaPreferenceBlock() }] : []),
     ...trimHistory([...persistedHistory, { role: "user" as const, content: userMessage }]),
     reinforcement,
   ];
