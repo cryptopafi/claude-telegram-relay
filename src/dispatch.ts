@@ -1,7 +1,8 @@
 import { homedir } from "os";
 import { join } from "path";
-import { appendFile, open, stat } from "fs/promises";
+import { appendFile, open, readFile, stat } from "fs/promises";
 import { createHash } from "crypto";
+import { execFile } from "child_process";
 import { isDuplicate, markProcessed } from "./dispatch-dedup";
 import { isEnabled } from "./feature-flags";
 
@@ -55,11 +56,45 @@ type CandidateScore = {
   matchedPatterns: string[];
 };
 
+type RoutingDomain = "research" | "marketing" | "development" | "ops" | "orchestration";
+type NexusComplexity = "low" | "medium" | "high";
+type NexusTaskType = Exclude<TaskType, TaskType.CODE | TaskType.GENERAL>;
+
+type NexusRouteConfig = {
+  agent: string;
+  domain: RoutingDomain;
+  complexity: NexusComplexity;
+  budgetUsd: string;
+};
+
 const DISPATCH_CONFIDENCE_THRESHOLD = 0.6;
 const CODEX_BRIEF_PATH = join(homedir(), ".codex", "genie-to-codex.md");
 const CODEX_DELIVERY_PATH = join(homedir(), ".codex", "codex-to-genie.md");
+const NEXUS_SCRIPTS_DIR = join(homedir(), ".nexus", "scripts");
+const NEXUS_WORKSPACE_DIR = join(homedir(), ".nexus", "workspace");
+const NEXUS_TASK_CREATE_PATH = join(NEXUS_SCRIPTS_DIR, "nexus-task-create.sh");
+const NEXUS_ROUTING_TABLE_PATH = join(homedir(), ".nexus", "config", "routing-table.yaml");
 const POLL_INTERVAL_MS = 4000;
 const POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const NEXUS_POLL_INTERVAL_MS = 5000;
+const NEXUS_CREATE_TIMEOUT_MS = 10_000;
+
+const ROUTING_TIMEOUT_DEFAULTS: Record<RoutingDomain, number> = {
+  research: 2700,
+  marketing: 1800,
+  development: 2700,
+  ops: 600,
+  orchestration: 1800,
+};
+
+const NEXUS_ROUTE_BY_TASK: Record<NexusTaskType, NexusRouteConfig> = {
+  [TaskType.RESEARCH]: { agent: "iris", domain: "research", complexity: "medium", budgetUsd: "2.00" },
+  [TaskType.SYSTEM]: { agent: "sentinel", domain: "ops", complexity: "low", budgetUsd: "0.50" },
+  [TaskType.AUDIT]: { agent: "forge", domain: "development", complexity: "medium", budgetUsd: "2.00" },
+  [TaskType.BUSINESS]: { agent: "mercury", domain: "marketing", complexity: "medium", budgetUsd: "2.00" },
+  [TaskType.CALENDAR]: { agent: "genie", domain: "orchestration", complexity: "low", budgetUsd: "0.50" },
+  [TaskType.EMAIL]: { agent: "genie", domain: "orchestration", complexity: "low", budgetUsd: "0.50" },
+};
 
 const NOT_HANDLED: DispatchResult = {
   handled: false,
@@ -147,6 +182,18 @@ type PollerState = {
 };
 
 const codexPollers = new Map<string, PollerState>();
+
+type NexusPollerState = {
+  interval: ReturnType<typeof setInterval>;
+  expiresAt: number;
+  lastStatus: string;
+  chatId: string;
+  sendMessage: SendMessageFn;
+  route: NexusRouteConfig;
+};
+
+const nexusPollers = new Map<string, NexusPollerState>();
+let routingTimeoutCache: Record<RoutingDomain, number> | null = null;
 
 function normalizeText(input: string): string {
   return input.trim().replace(/\s+/g, " ");
@@ -239,6 +286,12 @@ function generateTaskId(): string {
   const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "");
   const random = Math.floor(Math.random() * 9000 + 1000);
   return `codex-task-${timestamp}-${random}`;
+}
+
+function generateNexusTaskId(): string {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "");
+  const random = Math.floor(Math.random() * 9000 + 1000);
+  return `task-${timestamp}-${random}`;
 }
 
 function renderCodexBrief(taskId: string, description: string, matchedPatterns: string[]): string {
@@ -342,6 +395,201 @@ function stopCodexPoller(chatId: string): void {
   codexPollers.delete(chatId);
 }
 
+function stopNexusPoller(taskId: string): void {
+  const poller = nexusPollers.get(taskId);
+  if (!poller) return;
+  clearInterval(poller.interval);
+  nexusPollers.delete(taskId);
+}
+
+function parseProgressScalar(content: string, key: string): string {
+  const match = content.match(new RegExp(`^\\s*${key}:\\s*(.+)$`, "m"));
+  const raw = match?.[1]?.trim() ?? "";
+  if (!raw || /^null$/i.test(raw)) return "";
+  const quoted = raw.match(/^["'](.*)["']$/);
+  return quoted ? quoted[1] : raw;
+}
+
+async function readNexusProgress(taskId: string): Promise<{ status: string; outputLocation: string } | null> {
+  const candidatePaths = [
+    join(NEXUS_WORKSPACE_DIR, "active", taskId, "PROGRESS.md"),
+    join(NEXUS_WORKSPACE_DIR, "completed", taskId, "PROGRESS.md"),
+    join(NEXUS_WORKSPACE_DIR, "blocked", taskId, "PROGRESS.md"),
+  ];
+
+  for (const progressPath of candidatePaths) {
+    try {
+      const content = await readFile(progressPath, "utf-8");
+      const status = parseProgressScalar(content, "status").toUpperCase() || "UNKNOWN";
+      const outputLocation = parseProgressScalar(content, "output_location");
+      return { status, outputLocation };
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
+}
+
+function parseRoutingTimeouts(content: string): Partial<Record<RoutingDomain, number>> {
+  const parsed: Partial<Record<RoutingDomain, number>> = {};
+  const lines = content.split(/\r?\n/);
+  let inRoutes = false;
+  let currentDomain: RoutingDomain | null = null;
+
+  for (const line of lines) {
+    if (!inRoutes) {
+      if (/^routes:\s*$/.test(line)) inRoutes = true;
+      continue;
+    }
+
+    if (/^precedence:\s*$/.test(line)) break;
+
+    const domainMatch = line.match(/^  ([a-z_]+):\s*$/);
+    if (domainMatch) {
+      const candidate = domainMatch[1];
+      currentDomain = Object.prototype.hasOwnProperty.call(ROUTING_TIMEOUT_DEFAULTS, candidate)
+        ? (candidate as RoutingDomain)
+        : null;
+      continue;
+    }
+
+    if (!currentDomain) continue;
+
+    const timeoutMatch = line.match(/^    timeout_s:\s*(\d+)\s*$/);
+    if (timeoutMatch && parsed[currentDomain] == null) {
+      parsed[currentDomain] = Number(timeoutMatch[1]);
+    }
+  }
+
+  return parsed;
+}
+
+async function getRoutingTimeouts(): Promise<Record<RoutingDomain, number>> {
+  if (routingTimeoutCache) return routingTimeoutCache;
+
+  try {
+    const content = await readFile(NEXUS_ROUTING_TABLE_PATH, "utf-8");
+    routingTimeoutCache = {
+      ...ROUTING_TIMEOUT_DEFAULTS,
+      ...parseRoutingTimeouts(content),
+    };
+    return routingTimeoutCache;
+  } catch {
+    routingTimeoutCache = { ...ROUTING_TIMEOUT_DEFAULTS };
+    return routingTimeoutCache;
+  }
+}
+
+async function execFileAsync(command: string, args: string[], timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    execFile(command, args, { timeout: timeoutMs, encoding: "utf-8" }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve();
+        return;
+      }
+
+      const details = [error.message, stderr, stdout].filter(Boolean).join(" | ").trim();
+      reject(new Error(details || "execFile failed"));
+    });
+  });
+}
+
+async function startNexusPoller(
+  taskId: string,
+  chatId: string,
+  sendMessage: SendMessageFn,
+  route: NexusRouteConfig,
+  timeoutMs: number
+): Promise<void> {
+  if (!taskId || !chatId || nexusPollers.has(taskId)) return;
+
+  const state: NexusPollerState = {
+    interval: setInterval(() => {}),
+    expiresAt: Date.now() + timeoutMs,
+    lastStatus: "",
+    chatId,
+    sendMessage,
+    route,
+  };
+
+  const tick = async (): Promise<void> => {
+    if (Date.now() > state.expiresAt) {
+      stopNexusPoller(taskId);
+      await state.sendMessage(state.chatId, `Nexus task ${taskId} timed out while waiting for completion.`).catch(
+        () => {}
+      );
+      return;
+    }
+
+    const progress = await readNexusProgress(taskId);
+    if (!progress) return;
+    if (progress.status === state.lastStatus) return;
+    state.lastStatus = progress.status;
+
+    if (progress.status !== "DONE" && progress.status !== "FAILED") return;
+
+    const outputSuffix = progress.outputLocation ? ` Output: ${progress.outputLocation}` : "";
+    const prefix = progress.status === "DONE" ? "✅" : "❌";
+    await state
+      .sendMessage(
+        state.chatId,
+        `${prefix} Nexus task ${taskId} (${state.route.agent}) finished with status ${progress.status}.${outputSuffix}`
+      )
+      .catch(() => {});
+    stopNexusPoller(taskId);
+  };
+
+  state.interval = setInterval(() => {
+    void tick();
+  }, NEXUS_POLL_INTERVAL_MS);
+
+  if (typeof (state.interval as any).unref === "function") {
+    (state.interval as any).unref();
+  }
+
+  nexusPollers.set(taskId, state);
+  await tick();
+}
+
+async function dispatchToAgent(context: DispatchContext, taskType: NexusTaskType): Promise<DispatchResult> {
+  const route = NEXUS_ROUTE_BY_TASK[taskType];
+  const description = sanitizeSingleLine(context.text).slice(0, 1000) || context.text.trim();
+  const taskId = generateNexusTaskId();
+
+  try {
+    await execFileAsync(
+      "bash",
+      [
+        NEXUS_TASK_CREATE_PATH,
+        taskId,
+        description,
+        route.agent,
+        route.complexity,
+        route.budgetUsd,
+      ],
+      NEXUS_CREATE_TIMEOUT_MS
+    );
+
+    const routingTimeouts = await getRoutingTimeouts();
+    const timeoutMs = (routingTimeouts[route.domain] ?? ROUTING_TIMEOUT_DEFAULTS[route.domain]) * 1000;
+    await startNexusPoller(taskId, context.chatId, context.sendMessage, route, timeoutMs);
+
+    return {
+      handled: true,
+      skipClaude: true,
+      response: `Task dispatched to ${route.agent} (${taskId}). I will post completion updates here.`,
+    };
+  } catch (error) {
+    console.warn(`[SMART_DISPATCH] ${taskType} adapter dispatch failed:`, error);
+    return {
+      handled: true,
+      skipClaude: false,
+      promptHint: fallbackPromptHint(taskType),
+    };
+  }
+}
+
 async function startCodexPoller(chatId: string, sendMessage: SendMessageFn, taskId: string): Promise<void> {
   if (!chatId || codexPollers.has(chatId)) return;
 
@@ -416,56 +664,32 @@ export async function codexAdapter(context: DispatchContext): Promise<DispatchRe
 
 export async function sentinelAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.SYSTEM) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.SYSTEM),
-  };
+  return dispatchToAgent(context, TaskType.SYSTEM);
 }
 
 export async function researchAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.RESEARCH) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.RESEARCH),
-  };
+  return dispatchToAgent(context, TaskType.RESEARCH);
 }
 
 export async function forgeAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.AUDIT) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.AUDIT),
-  };
+  return dispatchToAgent(context, TaskType.AUDIT);
 }
 
 export async function calendarAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.CALENDAR) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.CALENDAR),
-  };
+  return dispatchToAgent(context, TaskType.CALENDAR);
 }
 
 export async function emailAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.EMAIL) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.EMAIL),
-  };
+  return dispatchToAgent(context, TaskType.EMAIL);
 }
 
 export async function radarAdapter(context: DispatchContext): Promise<DispatchResult> {
   if (context.classification.type !== TaskType.BUSINESS) return NOT_HANDLED;
-  return {
-    handled: true,
-    skipClaude: false,
-    promptHint: fallbackPromptHint(TaskType.BUSINESS),
-  };
+  return dispatchToAgent(context, TaskType.BUSINESS);
 }
 
 const ADAPTER_BY_TYPE: Record<Exclude<TaskType, TaskType.GENERAL>, AdapterFn> = {

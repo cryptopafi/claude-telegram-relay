@@ -5,6 +5,7 @@
   "scripts": {
     "start": "bun run src/relay.ts",
     "dev": "bun run --watch src/relay.ts",
+    "build": "bunx tsc --noEmit -p tsconfig.json",
     "typecheck": "bunx tsc --noEmit -p tsconfig.json",
     "setup": "bun run setup/install.ts",
     "test:telegram": "bun run setup/test-telegram.ts",
