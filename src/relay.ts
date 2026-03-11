@@ -49,7 +49,7 @@ import {
 } from "./nexus-command";
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
-import { activateLuna, deactivateLuna, isLunaActive, sendToLuna } from "./luna";
+import { activateLuna, deactivateLuna, isLunaActive, resetLuna, sendToLuna, setLunaModel, getLunaModel } from "./luna";
 import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -1248,13 +1248,38 @@ bot.command("rule_modify", async (ctx) => {
   await ctx.reply(`Descrie modificarea pentru ${ruleId}:`);
 });
 
-// /luna command - activate Luna companion mode (text-only via Ollama)
+// /luna [qwen|mistral] command - activate Luna or switch model
 bot.command("luna", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (typeof chatId !== "number") return;
 
-  activateLuna(chatId);
-  await ctx.reply("Zi. Ce ai în cap azi — ceva interesant sau vii la mine să te plângi?");
+  const arg = ctx.match?.trim().toLowerCase();
+
+  if (arg === "reset") {
+    const firstMessage = resetLuna(chatId);
+    await sendResponse(ctx, firstMessage);
+    return;
+  }
+
+  if (arg === "qwen") {
+    setLunaModel("qwen3-abliterated:8b");
+    await ctx.reply(`Model schimbat: qwen3-abliterated:8b. Conversația continuă.`);
+    return;
+  }
+
+  if (arg === "mistral") {
+    setLunaModel("dolphin-mistral");
+    await ctx.reply(`Model schimbat: dolphin-mistral. Conversația continuă.`);
+    return;
+  }
+
+  const firstMessage = activateLuna(chatId);
+  if (firstMessage) {
+    await sendResponse(ctx, firstMessage);
+    return;
+  }
+
+  await ctx.reply("Luna activă. Sesiunea anterioară a fost restaurată.");
 });
 
 // /exit command - deactivate Luna mode and return to default relay flow
@@ -1364,7 +1389,10 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   const lunaChatId = ctx.chat?.id;
   if (typeof lunaChatId === "number" && process.env.BOT_MODE === "luna" && !isLunaActive(lunaChatId)) {
-    activateLuna(lunaChatId);
+    const firstMessage = activateLuna(lunaChatId);
+    if (firstMessage) {
+      await sendResponse(ctx, firstMessage);
+    }
   }
   if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
     try {

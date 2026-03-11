@@ -21,6 +21,8 @@ const SEMANTIC_PATTERNS = [
   String.raw`\bregula este\b`,
   String.raw`\bprocedura\s+[\p{L}\d_-]{2,}\b`,
   String.raw`\bpreferin(?:ț|t)a mea\b`,
+  String.raw`\b(?:hard limit|soft limit|safeword|kink|fetish|fantasy|rating|sissy|feminization|orgasm denial|aftercare)\b`,
+  String.raw`\b(?:limită|preferință|fantezi[ae]|fetiș|regulă|protocol|ritual|task|training)\b`,
 ];
 
 const REMEMBER_TAG_RE = /\[REMEMBER:\s*([^\]]+?)\]/giu;
@@ -271,6 +273,14 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH, { skipSession = false } =
       last_message_at INTEGER NOT NULL DEFAULT (unixepoch()),
       message_count INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS luna_sessions (
+      chat_id INTEGER NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+      content TEXT NOT NULL,
+      created_at INTEGER DEFAULT (unixepoch()),
+      PRIMARY KEY (chat_id, created_at)
+    );
   `);
 
   const existingColumns = new Set(
@@ -298,6 +308,7 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH, { skipSession = false } =
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity);");
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_type_topic ON memories(type, topic);");
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_consolidated_at ON memories(consolidated_at);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_luna_sessions_chat_created_at ON luna_sessions(chat_id, created_at DESC);");
   ensureFtsTokenizer(db);
   db.exec("PRAGMA journal_mode=WAL;");
 

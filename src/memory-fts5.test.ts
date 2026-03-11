@@ -23,6 +23,20 @@ describe("SEMANTIC_TRIGGER_RE", () => {
       expect(SEMANTIC_TRIGGER_RE.test(phrase)).toBe(true);
     }
   });
+
+  test("matches BDSM semantic trigger patterns", () => {
+    const phrases = [
+      "hard limit: breath play",
+      "my safeword is yellow",
+      "orgasm denial is a kink for me",
+      "preferință: ritual de seară",
+      "am o limită clară și un protocol",
+    ];
+
+    for (const phrase of phrases) {
+      expect(SEMANTIC_TRIGGER_RE.test(phrase)).toBe(true);
+    }
+  });
 });
 
 describe("memory extraction and retrieval", () => {
@@ -100,6 +114,16 @@ describe("memory extraction and retrieval", () => {
       .find((line) => line.startsWith("• "));
 
     expect(firstBullet?.includes("alpha")).toBe(true);
+    db.close();
+  });
+
+  test("creates luna session persistence table", () => {
+    const { db } = initMemoryDB(":memory:", { skipSession: true });
+    const table = db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'luna_sessions'")
+      .get() as { name: string } | null;
+
+    expect(table?.name).toBe("luna_sessions");
     db.close();
   });
 });
