@@ -1,5 +1,4 @@
 import { readFile } from "fs/promises";
-import { readdirSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 
@@ -33,10 +32,23 @@ export interface ContextLoaderDeps {
   loadMemorySummary?: (text: string) => Promise<string> | string;
   loadCortexContext?: (text: string) => Promise<string>;
   loadCortexProcedures?: (text: string) => Promise<string>;
-  loadSharedMemory?: () => Promise<string>;
+  loadSharedMemory?: (intent?: Intent) => Promise<string>;
   loadSessionLive?: () => Promise<string>;
   loadSentinelHealth?: () => Promise<string>;
   formatHistory?: (history: Message[]) => string;
+}
+
+interface SharedMemorySection {
+  header: string;
+  normalizedHeader: string;
+  body: string;
+  fullText: string;
+}
+
+interface CortexSearchResult {
+  text?: string;
+  metadata?: Record<string, unknown>;
+  score?: number;
 }
 
 const INTENT_RULES: Array<{ intent: Intent; patterns: RegExp[] }> = [
@@ -107,6 +119,18 @@ const LIMITS = {
   procedures: 4500,
   sentinel: 1800,
   sharedMemory: 5000,
+};
+
+const ALWAYS_INCLUDED_MEMORY_SECTIONS = ["System", "Failsafe", "Latest Session"] as const;
+
+const MEMORY_SECTIONS_BY_INTENT: Partial<Record<Intent, readonly string[]>> = {
+  code_task: ["Codex & Ollama", "Auto-Sync"],
+  system_op: ["Codex & Ollama", "Auto-Sync"],
+  business_question: ["Projects", "Albastru & Origini"],
+  research_query: ["Topic Index", "Training Procedures"],
+  audit_request: ["Custom Triggers"],
+  calendar_event: ["Telegram"],
+  email_task: ["Telegram"],
 };
 
 export function classifyMessageIntent(text: string): Intent {
@@ -222,25 +246,182 @@ async function defaultLoadSentinelHealth(): Promise<string> {
   }
 }
 
-async function defaultLoadSharedMemory(): Promise<string> {
-  const parts: string[] = [];
+function normalizeWhitespace(text: string): string {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function parseSharedMemorySections(markdown: string): SharedMemorySection[] {
+  const sections: SharedMemorySection[] = [];
+  let currentHeader = "";
+  let currentLines: string[] = [];
+
+  const flush = () => {
+    const header = currentHeader.trim();
+    if (!header) return;
+    const body = currentLines.join("\n").trim();
+    const fullText = body ? `## ${header}\n${body}` : `## ${header}`;
+    sections.push({
+      header,
+      normalizedHeader: header.toLowerCase(),
+      body,
+      fullText,
+    });
+  };
+
+  for (const line of String(markdown || "").split(/\r?\n/)) {
+    if (line.startsWith("## ")) {
+      flush();
+      currentHeader = line.slice(3).trim();
+      currentLines = [];
+      continue;
+    }
+
+    if (currentHeader) {
+      currentLines.push(line);
+    }
+  }
+
+  flush();
+  return sections;
+}
+
+function truncateToLimit(text: string, limit: number): string {
+  const value = String(text || "");
+  if (value.length <= limit) return value;
+  if (limit <= 3) return value.slice(0, limit);
+  return `${value.slice(0, limit - 3).trimEnd()}...`;
+}
+
+function appendWithinLimit(output: string, sectionText: string, limit: number): string {
+  const separator = output ? "\n\n" : "";
+  const remaining = limit - output.length - separator.length;
+  if (remaining <= 0) return output;
+
+  const boundedSection = truncateToLimit(sectionText, remaining);
+  if (!boundedSection) return output;
+  return `${output}${separator}${boundedSection}`;
+}
+
+function findSharedMemorySection(
+  sections: SharedMemorySection[],
+  sectionPrefix: string
+): SharedMemorySection | undefined {
+  const normalizedPrefix = sectionPrefix.toLowerCase();
+  return sections.find((section) => section.normalizedHeader.startsWith(normalizedPrefix));
+}
+
+export function buildSharedMemoryContext(
+  markdown: string,
+  intent?: Intent,
+  limit: number = LIMITS.sharedMemory
+): string {
+  const sections = parseSharedMemorySections(markdown);
+  const selectedPrefixes = [
+    ...ALWAYS_INCLUDED_MEMORY_SECTIONS,
+    ...(MEMORY_SECTIONS_BY_INTENT[intent || "simple_chat"] || []),
+  ];
+  const seenHeaders = new Set<string>();
+  let output = "";
+
+  for (const prefix of selectedPrefixes) {
+    const section = findSharedMemorySection(sections, prefix);
+    if (!section || seenHeaders.has(section.normalizedHeader)) continue;
+    seenHeaders.add(section.normalizedHeader);
+    output = appendWithinLimit(output, section.fullText, limit);
+    if (output.length >= limit) break;
+  }
+
+  return output;
+}
+
+export async function defaultLoadSharedMemory(intent?: Intent): Promise<string> {
   try {
     const memory = await readFile(join(MEMORY_DIR, "MEMORY.md"), "utf-8");
-    parts.push("SHARED MEMORY (from Claude Code sessions):\n" + memory);
-  } catch {}
+    return buildSharedMemoryContext(memory, intent, LIMITS.sharedMemory);
+  } catch {
+    return "";
+  }
+}
 
+function extractCortexTitle(result: CortexSearchResult): string {
+  const metadataTitle =
+    result.metadata && typeof result.metadata.title === "string" ? result.metadata.title.trim() : "";
+  if (metadataTitle) return metadataTitle;
+
+  const firstLine = String(result.text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+
+  return safeSlice(
+    String(firstLine || "")
+      .replace(/^#+\s*/, "")
+      .replace(/^[*-]\s*/, ""),
+    120
+  );
+}
+
+function extractCortexExcerpt(result: CortexSearchResult, title: string, limit: number): string {
+  const normalized = normalizeWhitespace(result.text || "");
+  if (!normalized) return "";
+  const loweredTitle = title.toLowerCase();
+  const loweredExcerpt = normalized.toLowerCase();
+
+  if (title && loweredExcerpt.startsWith(loweredTitle)) {
+    return safeSlice(normalized.slice(title.length).replace(/^[:.\-\s]+/, "").trim(), limit);
+  }
+
+  return safeSlice(normalized, limit);
+}
+
+async function searchCortex(
+  query: string,
+  collection: "decisions" | "procedures",
+  limit: number
+): Promise<CortexSearchResult[]> {
   try {
-    const files = readdirSync(MEMORY_DIR)
-      .filter((f) => f.startsWith("session-") && f.endsWith(".md"))
-      .sort()
-      .reverse();
-    if (files.length > 0) {
-      const latest = await readFile(join(MEMORY_DIR, files[0]), "utf-8");
-      parts.push("LATEST SESSION:\n" + latest.substring(0, 2200));
-    }
-  } catch {}
+    const response = await fetch(`${CORTEX_URL}/api/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: textOrEmpty(query), collection, limit }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return [];
+    const data = await response.json();
+    return Array.isArray(data.results) ? data.results : [];
+  } catch {
+    return [];
+  }
+}
 
-  return parts.join("\n\n");
+function textOrEmpty(value: string): string {
+  return String(value || "").trim();
+}
+
+export async function defaultLoadCortexContext(text: string): Promise<string> {
+  const results = await searchCortex(text, "decisions", 5);
+  if (results.length === 0) return "";
+
+  return results
+    .map((result) => {
+      const title = extractCortexTitle(result) || "Decision";
+      const excerpt = extractCortexExcerpt(result, title, 220);
+      return excerpt ? `- ${title}: ${excerpt}` : `- ${title}`;
+    })
+    .join("\n");
+}
+
+export async function defaultLoadCortexProcedures(text: string): Promise<string> {
+  const results = await searchCortex(text, "procedures", 3);
+  if (results.length === 0) return "";
+
+  return results
+    .map((result, index) => {
+      const title = extractCortexTitle(result) || `Procedure ${index + 1}`;
+      const excerpt = extractCortexExcerpt(result, title, 260);
+      return excerpt ? `${index + 1}. ${title} - ${excerpt}` : `${index + 1}. ${title}`;
+    })
+    .join("\n");
 }
 
 async function fetchCortexRulesDirect(): Promise<string> {
@@ -325,10 +506,10 @@ export async function loadContextForMessage(
 
   if (TIER2_INTENTS.has(intent)) {
     const [cortexContext, procedures, sentinelHealth, sharedMemory] = await Promise.all([
-      maybeLoad(() => deps.loadCortexContext?.(text)),
-      maybeLoad(() => deps.loadCortexProcedures?.(text)),
+      maybeLoad(() => (deps.loadCortexContext || defaultLoadCortexContext)(text)),
+      maybeLoad(() => (deps.loadCortexProcedures || defaultLoadCortexProcedures)(text)),
       maybeLoad(deps.loadSentinelHealth || defaultLoadSentinelHealth),
-      maybeLoad(deps.loadSharedMemory || defaultLoadSharedMemory),
+      maybeLoad(() => (deps.loadSharedMemory || defaultLoadSharedMemory)(intent)),
     ]);
 
     pushUniqueBlock(contextBlocks, seen, "[Tier 2] Cortex Deep Context:", safeSlice(cortexContext, LIMITS.cortexContext));
