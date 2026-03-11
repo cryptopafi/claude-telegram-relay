@@ -11,8 +11,21 @@ const MAX_HALF_LIFE = 365;
 const MAX_SALIENCE = 3.0;
 const MAX_MEMORIES = 5000;
 
-export const SEMANTIC_TRIGGER_RE =
-  /(?:^|[^\p{L}])(prefer|always|never|remember|I am|I'm|my name|I like|I don't|I do|I want|I need)(?:$|[^\p{L}])|(?:^|[^\p{L}])(prefer|mereu|niciodată|îmi place|nu îmi|ține minte|țin minte|eu sunt|vreau să|am nevoie|nu vreau|îmi trebuie|obișnuiesc|folosesc|am setat|am configurat|am decis|lucr[aă]m cu|contul|proiectul|echipa|agentul|regula|prefer[aă]|nu mai|de acum|dintotdeauna)(?:$|[^\p{L}])/iu;
+const SEMANTIC_PATTERNS = [
+  String.raw`\b(?:prefer|always|never|remember|i am|i'm|my name|i like|i don't|i do|i want|i need)\b`,
+  String.raw`\b(?:prefer|mereu|niciodată|îmi place|nu îmi|ține minte|țin minte|eu sunt|vreau să|am nevoie|nu vreau|îmi trebuie|obișnuiesc|folosesc|am setat|am configurat|am decis|lucr[aă]m cu|prefer[aă]|nu mai|de acum|dintotdeauna)\b`,
+  String.raw`\bcontul meu\b`,
+  String.raw`\bproiectul\s+[\p{L}\d_-]{2,}\b`,
+  String.raw`\bechipa are\b`,
+  String.raw`\bagentul\s+[\p{L}\d_-]{2,}\b`,
+  String.raw`\bregula este\b`,
+  String.raw`\bprocedura\s+[\p{L}\d_-]{2,}\b`,
+  String.raw`\bpreferin(?:ț|t)a mea\b`,
+];
+
+const REMEMBER_TAG_RE = /\[REMEMBER:\s*([^\]]+?)\]/giu;
+
+export const SEMANTIC_TRIGGER_RE = new RegExp(SEMANTIC_PATTERNS.join("|"), "iu");
 
 const STOPWORDS = new Set(
   [
@@ -141,18 +154,94 @@ const KNOWN_ENTITIES = new Map<string, RegExp>([
 ]);
 
 const TOPIC_KEYWORDS: Array<[RegExp, string]> = [
-  [/\bdeploy/i, "deployment"],
-  [/\bfix(?:ed|ing|es)?\b/i, "bugfix"],
-  [/\baudit/i, "quality"],
-  [/\btriage/i, "email"],
-  [/\bpipeline/i, "pipeline"],
-  [/\bresearch/i, "research"],
-  [/\bschedul/i, "calendar"],
+  [/\b(?:pipeline|flux)\b/i, "pipeline"],
+  [/\b(?:deploy|release|rollout)\b/i, "deployment"],
+  [/\b(?:fix(?:ed|ing|es)?|bug|eroare|repar\w*)\b/i, "bugfix"],
+  [/\b(?:audit|verific\w*)\b/i, "quality"],
+  [/\b(?:triage|email|mail|inbox)\b/i, "email"],
+  [/\b(?:research|cercet\w*|analiz\w*)\b/i, "research"],
+  [/\b(?:schedul\w*|calendar|întâlnire|intalnire|reminder)\b/i, "calendar"],
 ];
+
+const DIACRITIC_FOLD: Record<string, string> = {
+  ă: "a",
+  â: "a",
+  î: "i",
+  ș: "s",
+  ş: "s",
+  ț: "t",
+  ţ: "t",
+  Ă: "a",
+  Â: "a",
+  Î: "i",
+  Ș: "s",
+  Ş: "s",
+  Ț: "t",
+  Ţ: "t",
+};
 
 export interface MemoryDBContext {
   db: Database;
   sessionId: string;
+}
+
+function stripRomanianDiacritics(text: string): string {
+  return text.replace(/[ăâîșşțţĂÂÎȘŞȚŢ]/g, (char) => DIACRITIC_FOLD[char] || char);
+}
+
+function normalizeText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function splitSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((part) => normalizeText(part))
+    .filter(Boolean);
+}
+
+function createFtsArtifacts(db: Database): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+      text,
+      content=memories,
+      content_rowid=id,
+      tokenize='unicode61 remove_diacritics 0'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+      INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+  `);
+}
+
+function ensureFtsTokenizer(db: Database): void {
+  const row = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'").get() as
+    | { sql: string | null }
+    | null;
+  const sql = (row?.sql || "").toLowerCase();
+  if (!row || sql.includes("remove_diacritics 0")) {
+    createFtsArtifacts(db);
+    return;
+  }
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS memories_ai;
+    DROP TRIGGER IF EXISTS memories_ad;
+    DROP TRIGGER IF EXISTS memories_au;
+    DROP TABLE IF EXISTS memories_fts;
+  `);
+  createFtsArtifacts(db);
+  db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');");
 }
 
 export function computeSalience(salience: number, halfLifeDays: number, createdAt: number): number {
@@ -175,25 +264,6 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH, { skipSession = false } =
       last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
       access_count INTEGER NOT NULL DEFAULT 0
     );
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-      text,
-      content=memories,
-      content_rowid=id
-    );
-
-    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-      INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
-      INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
-    END;
 
     CREATE TABLE IF NOT EXISTS sessions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,8 +288,17 @@ export function initMemoryDB(dbPath = DEFAULT_DB_PATH, { skipSession = false } =
   if (!existingColumns.has("cortex_id")) {
     db.exec("ALTER TABLE memories ADD COLUMN cortex_id TEXT DEFAULT NULL;");
   }
+  if (!existingColumns.has("consolidated_at")) {
+    db.exec("ALTER TABLE memories ADD COLUMN consolidated_at INTEGER DEFAULT NULL;");
+  }
+  if (!existingColumns.has("consolidated_into")) {
+    db.exec("ALTER TABLE memories ADD COLUMN consolidated_into INTEGER DEFAULT NULL;");
+  }
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);");
   db.exec("CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_type_topic ON memories(type, topic);");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_consolidated_at ON memories(consolidated_at);");
+  ensureFtsTokenizer(db);
   db.exec("PRAGMA journal_mode=WAL;");
 
   let sessionId = "maintenance";
@@ -310,12 +389,18 @@ export function pruneExpired(db: Database): number {
 }
 
 function tokenizeForFts(text: string): string {
-  const tokens = text
+  const tokens = normalizeText(text)
     .toLowerCase()
-    .replace(/[^a-zăîâșțşţ0-9\s]/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
-    .filter((x) => x.length >= 2 && !STOPWORDS.has(x));
-  return tokens.slice(0, 10).join(" OR ");
+    .filter((x) => x.length >= 2 && !STOPWORDS.has(x))
+    .slice(0, 8);
+  const expanded = new Set<string>();
+  for (const token of tokens) {
+    expanded.add(token);
+    expanded.add(stripRomanianDiacritics(token));
+  }
+  return Array.from(expanded).filter(Boolean).slice(0, 12).join(" OR ");
 }
 
 function detectEntity(text: string): string | null {
@@ -326,24 +411,31 @@ function detectEntity(text: string): string | null {
 }
 
 function detectTopic(text: string): string | null {
+  const normalized = `${text}\n${stripRomanianDiacritics(text)}`;
   for (const [re, topic] of TOPIC_KEYWORDS) {
-    if (re.test(text)) return topic;
+    if (re.test(normalized)) return topic;
   }
   return null;
 }
 
 export function getMemoryContext(db: Database, userMessage: string): string {
   const q = tokenizeForFts(userMessage);
+  const queryTopic = detectTopic(userMessage);
   const relevant = q
     ? (db
         .query(
-          `SELECT rowid AS id, text
+          `SELECT m.id AS id, m.text
            FROM memories_fts
+           JOIN memories m ON m.id = memories_fts.rowid
            WHERE memories_fts MATCH ?1
-           ORDER BY rank
-           LIMIT 3`
+             AND (m.consolidated_at IS NULL OR m.type = 'semantic')
+           ORDER BY
+             CASE WHEN ?2 IS NOT NULL AND m.topic = ?2 THEN 0 ELSE 1 END ASC,
+             bm25(memories_fts) ASC,
+             m.salience DESC
+           LIMIT 5`
         )
-        .all(q) as Array<{ id: number; text: string }>)
+        .all(q, queryTopic) as Array<{ id: number; text: string }>)
     : [];
 
   const recent = db
@@ -351,10 +443,13 @@ export function getMemoryContext(db: Database, userMessage: string): string {
       `SELECT id, text
        FROM memories
        WHERE salience > ?1
-       ORDER BY last_accessed_at DESC
+         AND (consolidated_at IS NULL OR type = 'semantic')
+       ORDER BY
+         CASE WHEN ?2 IS NOT NULL AND topic = ?2 THEN 0 ELSE 1 END ASC,
+         last_accessed_at DESC
        LIMIT 5`
     )
-    .all(PRUNE_THRESHOLD) as Array<{ id: number; text: string }>;
+    .all(PRUNE_THRESHOLD, queryTopic) as Array<{ id: number; text: string }>;
 
   const merged: Array<{ id: number; text: string }> = [];
   const seen = new Set<number>();
@@ -374,23 +469,65 @@ export function getMemoryContext(db: Database, userMessage: string): string {
   return `[Memory context]\n${lines.join("\n")}\n---`;
 }
 
-function saveMemory(db: Database, text: string, type: "semantic" | "episodic"): void {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+function saveMemory(
+  db: Database,
+  text: string,
+  type: "semantic" | "episodic",
+  opts: { topic?: string | null; entity?: string | null; consolidatedFrom?: string | null } = {}
+): void {
+  const cleaned = normalizeText(text);
   if (!cleaned) return;
   const halfLife = type === "semantic" ? SEMANTIC_HALF_LIFE_DAYS : EPISODIC_HALF_LIFE_DAYS;
-  const entity = detectEntity(cleaned);
-  const topic = detectTopic(cleaned);
+  const entity = opts.entity !== undefined ? opts.entity : detectEntity(cleaned);
+  const topic = opts.topic !== undefined ? opts.topic : detectTopic(cleaned);
   db.query(
-    `INSERT INTO memories (text, type, salience, half_life_days, created_at, last_accessed_at, access_count, topic, entity)
-     VALUES (?1, ?2, 1.0, ?3, unixepoch(), unixepoch(), 0, ?4, ?5)`
-  ).run(cleaned.slice(0, 800), type, halfLife, topic, entity);
+    `INSERT INTO memories (
+      text, type, salience, half_life_days, created_at, last_accessed_at, access_count, topic, entity, consolidated_from
+    ) VALUES (?1, ?2, 1.0, ?3, unixepoch(), unixepoch(), 0, ?4, ?5, ?6)`
+  ).run(cleaned.slice(0, 800), type, halfLife, topic, entity, opts.consolidatedFrom ?? null);
 }
 
-function pickSemanticSentence(userMessage: string): string | null {
-  const normalized = userMessage.replace(/\s+/g, " ").trim();
-  if (!normalized || !SEMANTIC_TRIGGER_RE.test(normalized)) return null;
-  const first = normalized.split(/[.!?]/).map((s) => s.trim()).find(Boolean);
-  return first ? first.slice(0, 300) : normalized.slice(0, 300);
+function extractRememberFacts(text: string): string[] {
+  if (!text) return [];
+  const out: string[] = [];
+  for (const match of text.matchAll(REMEMBER_TAG_RE)) {
+    const fact = normalizeText(match[1] || "");
+    if (fact) out.push(fact.slice(0, 300));
+  }
+  return out;
+}
+
+function extractSemanticSentences(text: string, maxItems = 2): string[] {
+  const normalized = normalizeText(text);
+  if (!normalized) return [];
+  const picked: string[] = [];
+  for (const sentence of splitSentences(normalized)) {
+    if (!SEMANTIC_TRIGGER_RE.test(sentence)) continue;
+    picked.push(sentence.slice(0, 300));
+    if (picked.length >= maxItems) break;
+  }
+  if (picked.length === 0 && SEMANTIC_TRIGGER_RE.test(normalized)) {
+    picked.push(normalized.slice(0, 300));
+  }
+  return picked;
+}
+
+function uniqueTrimmed(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const cleaned = normalizeText(value);
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function buildEpisodicText(userMessage: string, assistantResponse: string): string {
+  return `User: ${userMessage.slice(0, 220)} | Assistant: ${assistantResponse.slice(0, 220)}`;
 }
 
 export function extractAndSaveMemories(
@@ -398,19 +535,24 @@ export function extractAndSaveMemories(
   userMessage: string,
   assistantResponse: string,
   messageCount?: number,
-  sessionId?: string
+  sessionId?: string,
+  rawAssistantResponse?: string
 ): void {
   if (sessionId) {
     updateSession(db, sessionId);
   }
 
-  const semantic = pickSemanticSentence(userMessage);
-  if (semantic) {
-    saveMemory(db, semantic, "semantic");
+  const semanticFacts = uniqueTrimmed([
+    ...extractSemanticSentences(userMessage, 2),
+    ...extractSemanticSentences(assistantResponse, 2),
+    ...extractRememberFacts(rawAssistantResponse || assistantResponse),
+  ]).slice(0, 6);
+
+  for (const fact of semanticFacts) {
+    saveMemory(db, fact, "semantic");
   }
 
-  const episodic = `User: ${userMessage.slice(0, 220)} | Assistant: ${assistantResponse.slice(0, 220)}`;
-  saveMemory(db, episodic, "episodic");
+  saveMemory(db, buildEpisodicText(userMessage, assistantResponse), "episodic");
 
   if (typeof messageCount === "number" && messageCount > 0 && messageCount % 100 === 0) {
     pruneExpired(db);

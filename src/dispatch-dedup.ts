@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 
 const MAX_ENTRIES = 1000;
-const TTL_MS = 60 * 60 * 1000; // 1 hour
+const TTL_MS = 5 * 60 * 1000; // 5 minutes — short enough to allow intentional retries, long enough to catch double-taps
 
 type FingerprintEntry = {
   expiresAt: number;

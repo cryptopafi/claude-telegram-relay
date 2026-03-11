@@ -24,6 +24,12 @@ import { startTrace, endTrace } from "./telemetry";
 import { initDispatch } from "./dispatch";
 import { initMemoryDB, getMemoryContext, extractAndSaveMemories } from "./memory-fts5";
 import {
+  classifyMessageIntent,
+  CortexRulesCache,
+  loadContextForMessage,
+  type ContextResult,
+} from "./context-loader";
+import {
   processCortexMemoryIntents,
   getCortexContext,
   getCortexRulesContext,
@@ -43,6 +49,7 @@ import {
 } from "./nexus-command";
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
+import { activateLuna, deactivateLuna, isLunaActive, sendToLuna } from "./luna";
 import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -229,6 +236,7 @@ const dispatch = initDispatch(bot, sendTelegram);
 const memoryContext = initMemoryDB(MEMORY_DB_PATH);
 const memoryDb = memoryContext.db;
 const memorySessionId = memoryContext.sessionId;
+const cortexRulesCache = new CortexRulesCache(() => getCortexRulesContext(), 5 * 60 * 1000);
 let processedMessageCount = 0;
 
 function memoryContextFor(userMessage: string): string {
@@ -240,10 +248,21 @@ function memoryContextFor(userMessage: string): string {
   }
 }
 
-function saveConversationMemories(userMessage: string, assistantResponse: string): void {
+function saveConversationMemories(
+  userMessage: string,
+  assistantResponse: string,
+  rawAssistantResponse?: string
+): void {
   try {
     processedMessageCount += 1;
-    extractAndSaveMemories(memoryDb, userMessage, assistantResponse, processedMessageCount, memorySessionId);
+    extractAndSaveMemories(
+      memoryDb,
+      userMessage,
+      assistantResponse,
+      processedMessageCount,
+      memorySessionId,
+      rawAssistantResponse
+    );
   } catch (error) {
     console.warn("[MEMORY] extractAndSaveMemories failed:", error);
   }
@@ -1229,6 +1248,25 @@ bot.command("rule_modify", async (ctx) => {
   await ctx.reply(`Descrie modificarea pentru ${ruleId}:`);
 });
 
+// /luna command - activate Luna companion mode (text-only via Ollama)
+bot.command("luna", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+
+  activateLuna(chatId);
+  await ctx.reply("Zi. Ce ai în cap azi — ceva interesant sau vii la mine să te plângi?");
+});
+
+// /exit command - deactivate Luna mode and return to default relay flow
+bot.command("exit", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+  if (!isLunaActive(chatId)) return;
+
+  deactivateLuna(chatId);
+  await ctx.reply("Ok, revin la normal.");
+});
+
 // ============================================================
 // NEXUS APPROVAL GATE — V/G/R Response Handler
 // ============================================================
@@ -1324,6 +1362,21 @@ redirect_agent: "${safeRedirect}"
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+  const lunaChatId = ctx.chat?.id;
+  if (typeof lunaChatId === "number" && process.env.BOT_MODE === "luna" && !isLunaActive(lunaChatId)) {
+    activateLuna(lunaChatId);
+  }
+  if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
+    try {
+      const lunaResponse = await sendToLuna(lunaChatId, text);
+      await sendResponse(ctx, lunaResponse);
+    } catch (error) {
+      console.error("Luna handler error:", error);
+      await ctx.reply("Luna nu e disponibilă acum. Ollama offline?");
+    }
+    return;
+  }
+
   const messageId = ctx.message.message_id || Date.now();
   const userId = ctx.from?.id?.toString() || "unknown";
   const featureFlags = getAllFlags();
@@ -1506,41 +1559,63 @@ bot.on("message:text", async (ctx) => {
     await appendToLog("user", text);
     await storeTelegramMessage("user", text);
 
-    // Gather context: conversation history + URLs + Cortex + procedures
-    const [sharedMemory, urlContents, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
-      loadSharedMemory(),
-      extractUrlContent(text),
-      getCortexContext(text),
-      getCortexRulesContext(),
-      getCortexProcedures(text),
-    ]);
-
-    const history = formatHistory();
-    const urlContext = formatExtractedContent(urlContents);
+    const contextOptimizationEnabled = isEnabled("FEATURE_CONTEXT_OPTIMIZATION");
+    const urlContentsPromise = extractUrlContent(text);
     const buildPromptStart = Date.now();
-    let enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules, dispatchPromptHint);
-    if (cortexProcedures) {
-      enrichedPrompt += "\n\n" + cortexProcedures;
+    let enrichedPrompt = "";
+
+    if (contextOptimizationEnabled) {
+      const intent = classifyMessageIntent(text);
+      const optimizedContext = await loadContextForMessage(text, intent, chatHistory, {
+        systemPromptTemplate,
+        rulesCache: cortexRulesCache,
+        loadMemorySummary: () => memoryContextFor(text),
+        loadCortexContext: getCortexContext,
+        loadCortexProcedures: getCortexProcedures,
+        loadSharedMemory: loadSharedMemory,
+      });
+      enrichedPrompt = buildPromptFromOptimizedContext(text, optimizedContext, dispatchPromptHint);
+      console.log(
+        `[CONTEXT_OPT] intent=${intent} tier=${optimizedContext.tier} total_chars=${optimizedContext.totalChars}`
+      );
+    } else {
+      // Legacy path (backward-compatible): full context load
+      const [sharedMemory, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
+        loadSharedMemory(),
+        getCortexContext(text),
+        cortexRulesCache.getRules(),
+        getCortexProcedures(text),
+      ]);
+
+      const history = formatHistory();
+      enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules, dispatchPromptHint);
+      if (cortexProcedures) {
+        enrichedPrompt += "\n\n" + cortexProcedures;
+      }
+      if (history) {
+        enrichedPrompt = history + "\n\n" + enrichedPrompt;
+      }
+      const memCtx = memoryContextFor(text);
+      if (memCtx) {
+        enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
+      }
     }
+
+    const urlContents = await urlContentsPromise;
+    const urlContext = formatExtractedContent(urlContents);
     if (urlContext) {
       enrichedPrompt = urlContext + "\n\n" + enrichedPrompt;
     }
-    if (history) {
-      enrichedPrompt = history + "\n\n" + enrichedPrompt;
-    }
-    const memCtx = memoryContextFor(text);
-    if (memCtx) {
-      enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
-    }
+
     traceBuildPromptMs = Date.now() - buildPromptStart;
     const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
     traceModel = model;
     const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
 
     // Parse memory intents, save tags, and store procedures
-    const afterMemory = await processMemoryIntents(rawResponse);
-    const afterCortex = await processCortexMemoryIntents(afterMemory);
-    const afterProcedures = await processProcedureTags(afterCortex);
+    const afterCortex = await processCortexMemoryIntents(rawResponse);
+    const afterMemory = await processMemoryIntents(afterCortex);
+    const afterProcedures = await processProcedureTags(afterMemory);
     const { cleaned: response, notes } = parseSaveTags(afterProcedures);
     for (const note of notes) {
       await saveToSharedMemory(note);
@@ -1567,7 +1642,7 @@ bot.on("message:text", async (ctx) => {
     await addToHistory("assistant", checkedResponse);
     await appendToLog("assistant", checkedResponse);
     await storeTelegramMessage("assistant", checkedResponse);
-    saveConversationMemories(text, checkedResponse);
+    saveConversationMemories(text, checkedResponse, rawResponse);
     // Auto-save important exchanges to Cortex (MEM-H-002)
     autoSaveToCortex(text, checkedResponse).catch(() => {});
     await sendResponse(ctx, checkedResponse);
@@ -1583,7 +1658,7 @@ Detalii: ${(error as Error).message?.slice(0, 100) || "unknown"}`);
     clearInterval(typingInterval);
     await endTrace(messageId, {
       userId,
-      messageType: "text",
+      messageType: traceMessageType,
       tokensUsed: traceTokensUsed,
       model: traceModel,
       featuresActive: activeFeatures,
@@ -1629,7 +1704,7 @@ Groq Whisper nu a putut procesa audio-ul (${voice.duration}s). Încearcă din no
 
     const [cortexContext, cortexRules, cortexProcedures] = await Promise.all([
       getCortexContext(transcription),
-      getCortexRulesContext(),
+      cortexRulesCache.getRules(),
       getCortexProcedures(transcription),
     ]);
 
@@ -1920,13 +1995,6 @@ async function loadSharedMemory(): Promise<string> {
       parts.push("LATEST SESSION:\n" + latest.substring(0, 2000));
     }
   } catch {}
-  // SESSION-LIVE bridge: real-time context from active Claude Code sessions
-  try {
-    const sessionLive = await readFile(join(homedir(), ".nexus", "workspace", "intel", "SESSION-LIVE.md"), "utf-8");
-    if (sessionLive.trim()) {
-      parts.push("LIVE SESSION (what Pafi is doing right now in Claude Code):\n" + sessionLive.substring(0, 3000));
-    }
-  } catch {}
   return parts.join("\n\n");
 }
 
@@ -2023,6 +2091,71 @@ function buildPrompt(
   parts.push(`\nUser: ${userMessage}`);
 
   // Note: conversation history is prepended by the caller
+  return parts.join("\n");
+}
+
+function buildPromptFromOptimizedContext(
+  userMessage: string,
+  context: ContextResult,
+  dispatchHint?: string
+): string {
+  const now = new Date();
+  const timeStr = now.toLocaleString("en-US", {
+    timeZone: USER_TIMEZONE,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const hourNum = parseInt(
+    now.toLocaleString("en-US", { timeZone: USER_TIMEZONE, hour: "numeric", hour12: false })
+  );
+  const timeOfDay = hourNum >= 6 && hourNum < 12
+    ? "morning"
+    : hourNum >= 12 && hourNum < 18
+      ? "afternoon"
+      : hourNum >= 18 && hourNum < 23
+        ? "evening"
+        : "night";
+
+  const detectedLang = detectLanguage(userMessage);
+  const langNote = detectedLang === "ro"
+    ? "Detected language: Romanian. Respond in Romanian."
+    : detectedLang === "en"
+      ? "Detected language: English. Respond in English."
+      : "";
+  const template = context.systemPrompt || systemPromptTemplate;
+  const contextPayload = context.contextBlocks.join("\n\n");
+
+  if (template) {
+    const prompt = template
+      .replace("{{CURRENT_TIME}}", `Current time: ${timeStr} (${timeOfDay})${langNote ? "\n" + langNote : ""}`)
+      .replace("{{SESSION_LIVE}}", "Loaded via optimized context blocks.")
+      .replace("{{SENTINEL_HEALTH}}", "Loaded via optimized context blocks when needed.");
+
+    const parts = [prompt];
+    if (dispatchHint) {
+      parts.push(`\n<dispatch_hint>\n${escapeXmlContent(dispatchHint)}\n</dispatch_hint>`);
+    }
+    if (contextPayload) {
+      parts.push(
+        `\n<context_blocks tier=\"${context.tier}\" total_chars=\"${context.totalChars}\">\n${escapeXmlContent(contextPayload)}\n</context_blocks>`
+      );
+    }
+    parts.push(`\n<user_message>\n${escapeXmlContent(userMessage)}\n</user_message>`);
+    return parts.join("\n");
+  }
+
+  const parts = [
+    "You are Lis, Pafi's personal AI assistant on Telegram. Keep responses concise and practical.",
+    `Current time: ${timeStr} (${timeOfDay})`,
+  ];
+  if (dispatchHint) parts.push(`\nDispatch hint:\n${dispatchHint}`);
+  if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
+  if (contextPayload) parts.push(`\n${contextPayload}`);
+  parts.push(`\nUser: ${userMessage}`);
   return parts.join("\n");
 }
 

@@ -140,6 +140,7 @@ type PollerState = {
   interval: ReturnType<typeof setInterval>;
   expiresAt: number;
   lastDeliveryFingerprint: string;
+  taskId: string;
 };
 
 const codexPollers = new Map<string, PollerState>();
@@ -260,7 +261,7 @@ function renderCodexBrief(taskId: string, description: string, matchedPatterns: 
 - Classification patterns: ${patternsBlock}
 
 **Task**:
-${description}
+${description.replace(/^(#{1,6}\s|[*_]{2}Status[*_]{2})/gm, "").trim()}
 
 **Output expected**:
 - Implement requested code changes in the relevant repo/workspace
@@ -330,7 +331,7 @@ function stopCodexPoller(chatId: string): void {
   codexPollers.delete(chatId);
 }
 
-async function startCodexPoller(chatId: string, sendMessage: SendMessageFn): Promise<void> {
+async function startCodexPoller(chatId: string, sendMessage: SendMessageFn, taskId: string): Promise<void> {
   if (!chatId || codexPollers.has(chatId)) return;
 
   const initialOffset = await getFileSize(CODEX_DELIVERY_PATH);
@@ -339,6 +340,7 @@ async function startCodexPoller(chatId: string, sendMessage: SendMessageFn): Pro
     interval: setInterval(() => {}),
     expiresAt: Date.now() + POLL_TIMEOUT_MS,
     lastDeliveryFingerprint: "",
+    taskId,
   };
 
   const tick = async (): Promise<void> => {
@@ -353,6 +355,9 @@ async function startCodexPoller(chatId: string, sendMessage: SendMessageFn): Pro
 
     const deliveryLine = pickDeliveryLine(chunk);
     if (!deliveryLine) return;
+
+    // Only forward lines that match this task's ID
+    if (state.taskId && !deliveryLine.includes(state.taskId)) return;
 
     const fingerprint = contentFingerprint(deliveryLine);
     if (fingerprint === state.lastDeliveryFingerprint) return;
@@ -382,7 +387,7 @@ export async function codexAdapter(context: DispatchContext): Promise<DispatchRe
 
   try {
     await appendFile(CODEX_BRIEF_PATH, `\n\n${brief}\n`, "utf-8");
-    await startCodexPoller(context.chatId, context.sendMessage);
+    await startCodexPoller(context.chatId, context.sendMessage, taskId);
     return {
       handled: true,
       skipClaude: true,
@@ -493,7 +498,7 @@ export function initDispatch(bot: unknown, sendMessage: SendMessageFn) {
         classification,
       });
 
-      if (result.handled) {
+      if (result.handled && result.skipClaude) {
         markProcessed(text);
       }
 
