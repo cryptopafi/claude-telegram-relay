@@ -312,14 +312,22 @@ function pickDeliveryLine(chunk: string): string {
     .map((line) => line.trim())
     .filter(Boolean);
 
+  // Priority 1: lines with explicit task IDs (best for taskId filtering)
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index];
     if (/\[(m4-\d+|codex-task-[^\]]+|SYNC)/i.test(line)) return line;
+  }
+
+  // Priority 2: ## headers (e.g., "## Delivery m4-442: P5-BATCH-D")
+  const header = lines.find((line) => /^##\s+/i.test(line));
+  if (header) return header;
+
+  // Priority 3: status lines (DONE/BLOCKED/ERROR) — last resort
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
     if (/\b(DONE|BLOCKED|ERROR)\b/i.test(line)) return line;
   }
 
-  const header = lines.find((line) => /^##\s+/i.test(line));
-  if (header) return header;
   return lines.at(-1) ?? "";
 }
 
