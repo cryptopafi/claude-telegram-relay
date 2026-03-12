@@ -1,6 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
-import { appendFile, open, readFile, stat } from "fs/promises";
+import { appendFile, mkdir, open, readFile, stat } from "fs/promises";
 import { createHash } from "crypto";
 import { execFile } from "child_process";
 import { isDuplicate, markProcessed } from "./dispatch-dedup";
@@ -176,11 +176,14 @@ const ROUTING_PATTERNS: Record<Exclude<TaskType, TaskType.GENERAL>, PatternRule[
 
 type PollerState = {
   offset: number;
+  inode: number | null;
   timer: ReturnType<typeof setTimeout> | null;
   expiresAt: number;
-  lastDeliveryFingerprint: string;
+  seenFingerprints: Set<string>;
   taskId: string;
   isTickRunning: boolean;
+  leftoverLine: string;
+  idleTicks: number;
 };
 
 const codexPollers = new Map<string, PollerState>();
@@ -338,25 +341,70 @@ async function getFileSize(path: string): Promise<number> {
   }
 }
 
-async function readChunkFromOffset(path: string, offset: number): Promise<{ nextOffset: number; chunk: string }> {
+async function readChunkFromOffset(
+  path: string,
+  offset: number,
+  lastInode: number | null
+): Promise<{ nextOffset: number; chunk: string; inode: number | null }> {
   let handle: Awaited<ReturnType<typeof open>> | null = null;
   try {
     handle = await open(path, "r");
     const fileStat = await handle.stat();
 
-    if (fileStat.size <= offset) {
-      return { nextOffset: fileStat.size, chunk: "" };
+    // H1 fix: detect log rotation (inode change or shrink) and reset offset to 0
+    if ((lastInode != null && fileStat.ino !== lastInode) || fileStat.size < offset) {
+      offset = 0;
+    }
+    if (fileStat.size === offset) {
+      return { nextOffset: offset, chunk: "", inode: fileStat.ino ?? null };
     }
 
     const bytesToRead = Math.min(fileStat.size - offset, MAX_READ_CHUNK_BYTES);
     const buffer = Buffer.alloc(bytesToRead);
-    await handle.read(buffer, 0, bytesToRead, offset);
+    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, offset);
+
+    // UTF-8 safe boundary: avoid splitting multi-byte characters at chunk edge.
+    // Always validate — even at EOF, a mid-flush write can leave incomplete chars.
+    let safeBytesRead = bytesRead;
+    const getUtf8SeqLen = (lead: number): number => {
+      if ((lead & 0x80) === 0x00) return 1;
+      if ((lead & 0xe0) === 0xc0) return 2;
+      if ((lead & 0xf0) === 0xe0) return 3;
+      if ((lead & 0xf8) === 0xf0) return 4;
+      return 1;
+    };
+    let trailing = 0;
+    while (trailing < bytesRead && (buffer[bytesRead - 1 - trailing] & 0xc0) === 0x80) {
+      trailing++;
+    }
+    if (trailing > 0) {
+      const leadIndex = bytesRead - 1 - trailing;
+      if (leadIndex >= 0) {
+        const expectedLen = getUtf8SeqLen(buffer[leadIndex]);
+        const availableLen = trailing + 1;
+        if (expectedLen > availableLen) {
+          safeBytesRead = leadIndex;
+        }
+      }
+    } else if (bytesRead > 0) {
+      const last = buffer[bytesRead - 1];
+      const expectedLen = getUtf8SeqLen(last);
+      if (expectedLen > 1) {
+        safeBytesRead = bytesRead - 1;
+      }
+    }
+    // Guard: if all bytes were continuation bytes (corrupt data), advance anyway
+    if (safeBytesRead === 0 && bytesRead > 0) {
+      safeBytesRead = bytesRead;
+    }
+
     return {
-      nextOffset: offset + bytesToRead,
-      chunk: buffer.toString("utf-8"),
+      nextOffset: offset + safeBytesRead,
+      chunk: buffer.subarray(0, safeBytesRead).toString("utf-8"),
+      inode: fileStat.ino ?? null,
     };
   } catch {
-    return { nextOffset: offset, chunk: "" };
+    return { nextOffset: offset, chunk: "", inode: lastInode ?? null };
   } finally {
     await handle?.close().catch(() => {});
   }
@@ -370,19 +418,31 @@ function pickDeliveryLines(chunk: string): string[] {
 
   if (lines.length === 0) return [];
 
-  // Priority 1: lines with explicit task IDs (best for taskId filtering)
-  const explicitIdLines = lines.filter((line) => /\[(m4-\d+|codex-task-[^\]]+|SYNC)/i.test(line));
-  if (explicitIdLines.length > 0) return explicitIdLines;
+  // H3 fix: collect ALL matching lines across all categories instead of
+  // early-returning on the first match type (which dropped valid status lines)
+  const seen = new Set<string>();
+  const result: string[] = [];
 
-  // Priority 2: ## headers (e.g., "## Delivery m4-442: P5-BATCH-D")
-  const headers = lines.filter((line) => /^##\s+/i.test(line));
-  if (headers.length > 0) return headers;
+  const addUnique = (line: string): void => {
+    if (!seen.has(line)) {
+      seen.add(line);
+      result.push(line);
+    }
+  };
 
-  // Priority 3: status lines (DONE/BLOCKED/ERROR)
-  const statusLines = lines.filter((line) => /\b(DONE|BLOCKED|ERROR)\b/i.test(line));
-  if (statusLines.length > 0) return statusLines;
+  for (const line of lines) {
+    if (/\[(m4-\d+|codex-task-[^\]]+|SYNC)/i.test(line)) addUnique(line);
+    else if (/^##\s+/i.test(line)) addUnique(line);
+    else if (/\b(DONE|BLOCKED|ERROR)\b/i.test(line)) addUnique(line);
+  }
 
-  return [lines.at(-1) ?? ""].filter(Boolean);
+  // Fallback: last line if nothing matched
+  if (result.length === 0) {
+    const last = lines[lines.length - 1];
+    if (last) result.push(last);
+  }
+
+  return result;
 }
 
 function contentFingerprint(text: string): string {
@@ -442,13 +502,13 @@ function parseRoutingTimeouts(content: string): Partial<Record<RoutingDomain, nu
 
   for (const line of lines) {
     if (!inRoutes) {
-      if (/^routes:\s*$/.test(line)) inRoutes = true;
-      continue;
-    }
+    if (/^routes:\s*(?:#.*)?$/.test(line)) inRoutes = true;
+    continue;
+  }
 
-    if (/^precedence:\s*$/.test(line)) break;
+    if (/^precedence:\s*(?:#.*)?$/.test(line)) break;
 
-    const domainMatch = line.match(/^  ([a-z_]+):\s*$/);
+    const domainMatch = line.match(/^  ([a-z_]+):\s*(?:#.*)?$/);
     if (domainMatch) {
       const candidate = domainMatch[1];
       currentDomain = Object.prototype.hasOwnProperty.call(ROUTING_TIMEOUT_DEFAULTS, candidate)
@@ -459,7 +519,7 @@ function parseRoutingTimeouts(content: string): Partial<Record<RoutingDomain, nu
 
     if (!currentDomain) continue;
 
-    const timeoutMatch = line.match(/^    timeout_s:\s*(\d+)\s*$/);
+    const timeoutMatch = line.match(/^    timeout_s:\s*(\d+)\s*(?:#.*)?$/);
     if (timeoutMatch && parsed[currentDomain] == null) {
       parsed[currentDomain] = Number(timeoutMatch[1]);
     }
@@ -479,8 +539,8 @@ async function getRoutingTimeouts(): Promise<Record<RoutingDomain, number>> {
     };
     return routingTimeoutCache;
   } catch {
-    routingTimeoutCache = { ...ROUTING_TIMEOUT_DEFAULTS };
-    return routingTimeoutCache;
+    // Don't cache on failure — allow retry on next call
+    return { ...ROUTING_TIMEOUT_DEFAULTS };
   }
 }
 
@@ -611,11 +671,14 @@ async function startCodexPoller(chatId: string, sendMessage: SendMessageFn, task
   const initialOffset = await getFileSize(CODEX_DELIVERY_PATH);
   const state: PollerState = {
     offset: initialOffset,
+    inode: null,
     timer: null,
     expiresAt: Date.now() + POLL_TIMEOUT_MS,
-    lastDeliveryFingerprint: "",
+    seenFingerprints: new Set<string>(),
     taskId,
     isTickRunning: false,
+    leftoverLine: "",
+    idleTicks: 0,
   };
 
   const scheduleNextTick = (): void => {
@@ -632,28 +695,77 @@ async function startCodexPoller(chatId: string, sendMessage: SendMessageFn, task
     if (state.isTickRunning || !codexPollers.has(taskId)) return;
     state.isTickRunning = true;
     try {
-      if (Date.now() > state.expiresAt) {
-        stopCodexPoller(taskId);
+      const expired = Date.now() > state.expiresAt;
+
+      const { nextOffset, chunk, inode } = await readChunkFromOffset(CODEX_DELIVERY_PATH, state.offset, state.inode);
+      state.offset = nextOffset;
+      state.inode = inode;
+      state.idleTicks = chunk ? 0 : state.idleTicks + 1;
+      const flushIdleLeftover = !chunk && state.leftoverLine && state.idleTicks >= 3;
+
+      // Prepend leftover from previous chunk to avoid losing split lines
+      const fullChunk = state.leftoverLine + chunk + (flushIdleLeftover ? "\n" : "");
+      if (!fullChunk.trim()) {
+        // Flush leftover on expiry so it's not lost
+        if (expired) { state.leftoverLine = ""; stopCodexPoller(taskId); }
         return;
       }
 
-      const { nextOffset, chunk } = await readChunkFromOffset(CODEX_DELIVERY_PATH, state.offset);
-      state.offset = nextOffset;
-      if (!chunk.trim()) return;
+      const splitLines = fullChunk.split(/\r?\n/);
+      // Last element may be incomplete if chunk didn't end on newline
+      if (expired) {
+        // On expiry, flush everything — no more reads coming
+        state.leftoverLine = "";
+      } else {
+        const endedWithNewline = flushIdleLeftover || chunk.endsWith("\n") || chunk.endsWith("\r\n");
+        state.leftoverLine = endedWithNewline ? "" : (splitLines.pop() ?? "");
+      }
 
-      const deliveryLines = pickDeliveryLines(chunk);
-      if (deliveryLines.length === 0) return;
+      const deliveryLines = pickDeliveryLines(splitLines.join("\n"));
+      if (deliveryLines.length === 0) {
+        if (expired) stopCodexPoller(taskId);
+        return;
+      }
+
+      let taskCompleted = false;
+      const chunkHasTaskId = state.taskId
+        ? deliveryLines.some((line) => line.includes(state.taskId))
+        : false;
+      const chunkHasOtherTaskId = deliveryLines.some(
+        (line) => line.includes("codex-task-") && !line.includes(state.taskId)
+      );
 
       for (const deliveryLine of deliveryLines) {
-        // Only forward lines that match this task's ID
-        if (state.taskId && !deliveryLine.includes(state.taskId)) continue;
+        // Only forward lines that match this task's ID (but always allow completion markers)
+        const isCompletion = /\b(DONE|COMPLETE|ERROR|FAILED)\b/i.test(deliveryLine);
+        const allowCompletionWithoutId = isCompletion && chunkHasTaskId && !chunkHasOtherTaskId;
+        if (state.taskId && !deliveryLine.includes(state.taskId) && !allowCompletionWithoutId) continue;
 
         const fingerprint = contentFingerprint(deliveryLine);
-        if (fingerprint === state.lastDeliveryFingerprint) continue;
-        state.lastDeliveryFingerprint = fingerprint;
+        if (state.seenFingerprints.has(fingerprint)) continue;
+        state.seenFingerprints.add(fingerprint);
+        if (state.seenFingerprints.size > 500) {
+          let removed = 0;
+          const target = Math.floor(state.seenFingerprints.size / 2);
+          for (const entry of state.seenFingerprints) {
+            state.seenFingerprints.delete(entry);
+            removed++;
+            if (removed >= target) break;
+          }
+        }
 
         const safeLine = deliveryLine.slice(0, 360);
         await sendMessage(chatId, `Codex update: ${safeLine}`).catch(() => {});
+
+        // Stop polling on completion markers
+        if (/\b(DONE|COMPLETE|ERROR|FAILED)\b/i.test(deliveryLine)) {
+          taskCompleted = true;
+        }
+      }
+
+      if (taskCompleted || expired) {
+        stopCodexPoller(taskId);
+        return;
       }
     } finally {
       state.isTickRunning = false;
@@ -675,6 +787,7 @@ export async function codexAdapter(context: DispatchContext): Promise<DispatchRe
   const brief = renderCodexBrief(taskId, description, context.classification.patterns);
 
   try {
+    await mkdir(join(homedir(), ".codex"), { recursive: true });
     await appendFile(CODEX_BRIEF_PATH, `\n\n${brief}\n`, "utf-8");
     await startCodexPoller(context.chatId, context.sendMessage, taskId);
     return {
