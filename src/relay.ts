@@ -344,9 +344,6 @@ function isPromptForgeTrivial(text: string): boolean {
   if (normalized.length < 50 && (PROMPTFORGE_TRIVIAL_ONLY.test(normalized) || PROMPTFORGE_CHITCHAT.test(normalized))) {
     return true;
   }
-  if (normalized.length <= 20 && /^[\p{L}\p{N}\s.!?,-]+$/u.test(normalized)) {
-    return true;
-  }
   return false;
 }
 
@@ -1813,6 +1810,11 @@ bot.on("message:text", async (ctx) => {
     console.log(
       `[PROMPTFORGE_GATE] class=${promptForgeDecision.promptClass} mode=${promptForgeDecision.mode} visibility=${promptForgeDecision.visibility} enabled=${promptForgeDecision.enabled} reason=${promptForgeDecision.reason}`
     );
+
+    if (promptForgeDecision.explicitTrigger && !promptForgeDecision.normalizedUserMessage) {
+      await sendTelegram(chatId, "Folosire: /opt <prompt de optimizat>");
+      return;
+    }
 
     // /opt manual trigger should stay in Lis path and not be intercepted by Smart Dispatch.
     if (!promptForgeDecision.explicitTrigger && isEnabled("FEATURE_SMART_DISPATCH")) {
