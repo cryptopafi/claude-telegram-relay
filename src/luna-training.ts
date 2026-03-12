@@ -1,61 +1,39 @@
-import { existsSync, readFileSync } from "fs";
+/**
+ * Luna training asset loader
+ * Reads files from config/luna-training/ directory
+ */
+
+import { readFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
-import { loadProfile } from "./luna-profile";
+import { fileURLToPath } from "url";
 
-function getProjectRoot(): string {
-  return dirname(dirname(import.meta.path));
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const TRAINING_DIR = join(MODULE_DIR, "..", "config", "luna-training");
+
+const TRAINING_ASSET_MAP: Record<string, string> = {
+  "1": "01-safety-limits-consent.md",
+  "2": "02-feminization-sissy-slut-mapping.md",
+  "3": "03-toys-bondage-latex-anal-chastity.md",
+  "4": "04-conditioning-hard-mode-week-plan.md",
+  "A": "01-safety-limits-consent.md",
+  "B": "02-feminization-sissy-slut-mapping.md",
+  "C": "03-toys-bondage-latex-anal-chastity.md",
+  "D": "04-conditioning-hard-mode-week-plan.md",
+};
+
+export function resolveTrainingAsset(label: string): string {
+  const normalized = label.trim().toUpperCase();
+  return TRAINING_ASSET_MAP[normalized] || label.trim().toLowerCase();
 }
 
-export function getTrainingConfigDir(): string {
-  return process.env.LUNA_TRAINING_DIR || join(getProjectRoot(), "config", "luna-training");
+export function readTrainingAsset(filename: string): string | null {
+  const safe = filename.replace(/[^a-zA-Z0-9._-]/g, "");
+  const resolved = join(TRAINING_DIR, safe);
+  if (!resolved.startsWith(TRAINING_DIR)) return null;
+  if (!existsSync(resolved)) return null;
+  return readFileSync(resolved, "utf-8").trim();
 }
 
-export function readTrainingAsset(fileName: string): string | null {
-  const path = join(getTrainingConfigDir(), fileName);
-  if (!existsSync(path)) return null;
-  try {
-    return readFileSync(path, "utf-8").trim();
-  } catch {
-    return null;
-  }
-}
-
-function shouldIncludeFeminizationMapping(): boolean {
-  const profile = loadProfile();
-  return (
-    profile.feminization.program_status === "active" ||
-    profile.feminization.program_status === "paused" ||
-    profile.feminization.identity_nature === "flagged_exploration"
-  );
-}
-
-function primaryDirectiveFile(phase: number): string | null {
-  const profile = loadProfile();
-  if (phase <= 0) return "session-1.txt";
-  if (phase === 1) {
-    return profile.hard_limits.length === 0 ? "session-2.txt" : "session-1.txt";
-  }
-  if (phase === 2) return "session-2.txt";
-  if (phase === 3) return "session-3.txt";
-  if (phase === 4) return "session-4.txt";
-  if (phase === 5) return "session-5.txt";
-  if (phase === 6) return "session-6.txt";
-  if (phase === 7) return "session-7.txt";
-  return null;
-}
-
-export function loadTrainingDirective(phase: number): string | null {
-  const fileName = primaryDirectiveFile(phase);
-  if (!fileName) return null;
-
-  const blocks: string[] = [];
-  const primary = readTrainingAsset(fileName);
-  if (primary) blocks.push(primary);
-
-  if (phase === 5 && shouldIncludeFeminizationMapping()) {
-    const mapping = readTrainingAsset("session-5b.txt");
-    if (mapping) blocks.push(mapping);
-  }
-
-  return blocks.length > 0 ? blocks.join("\n\n") : null;
+export function readStoryProtocol(): string | null {
+  return readTrainingAsset("story-protocol.md");
 }

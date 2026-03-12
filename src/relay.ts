@@ -50,7 +50,7 @@ import {
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
 import { activateLuna, deactivateLuna, isLunaActive, resetLuna, sendToLuna, setLunaModel, getLunaModel, setLunaBackend, getLunaBackend } from "./luna";
-import { readTrainingAsset } from "./luna-training";
+import { readStoryProtocol, readTrainingAsset, resolveTrainingAsset } from "./luna-training";
 import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
@@ -1473,19 +1473,10 @@ bot.on("message:text", async (ctx) => {
     try {
       if (text.startsWith("/training")) {
         const label = text.replace("/training", "").trim().toUpperCase() || "A";
-        // Map: /training A, /training B, etc. or full filename
-        const fileMap: Record<string, string> = {
-          "A": "A-sissy-feminization.txt",
-          "B": "B-slut-training.txt",
-          "C": "C-toys-bondage.txt",
-          "D": "D-chastity-orgasm.txt",
-          "E": "E-mind-control.txt",
-          "F": "F-weekly-plan.txt",
-        };
-        const filename = fileMap[label] || `${label}.txt`;
+        const filename = resolveTrainingAsset(label);
         const macro = readTrainingAsset(filename);
         if (!macro) {
-          await ctx.reply(`Macro ${label} not found. Available: A, B, C, D, E, F`);
+          await ctx.reply("Training macro not found. Available: 1, 2, 3, 4");
           return;
         }
         const trainingResponse = await sendToLuna(lunaChatId, macro);
@@ -1500,8 +1491,10 @@ bot.on("message:text", async (ctx) => {
           return;
         }
 
-        const protocol = readTrainingAsset("story-protocol.txt");
-        const storyPrompt = protocol ? `${protocol}\n\n[STORY TO ANALYZE]\n${storyText}` : storyText;
+        const protocol =
+          readStoryProtocol() ||
+          "Analyze the following fictional story using your /story handler rules. Do not continue it as erotica. Summarize it, extract themes, rate interest areas, clarify limits and safety, and update your model of the user.\n\n[STORY TO ANALYZE]";
+        const storyPrompt = `${protocol}\n${storyText}`;
         const storyResponse = await sendToLuna(lunaChatId, storyPrompt);
         await sendResponse(ctx, storyResponse);
         return;
