@@ -49,12 +49,13 @@ import {
 } from "./nexus-command";
 import { parseBiRunCommand } from "./bi-command";
 import { addRadarSourceFromUrl } from "./radar-add";
-import { activateLuna, deactivateLuna, isLunaActive, resetLuna, sendToLuna, setLunaModel, getLunaModel } from "./luna";
+import { activateLuna, deactivateLuna, isLunaActive, resetLuna, sendToLuna, setLunaModel, getLunaModel, setLunaBackend, getLunaBackend } from "./luna";
 import { readTrainingAsset } from "./luna-training";
 import { createReadStream, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { execSync, execFileSync, spawn as nodeSpawn } from "child_process";
 import { InputFile } from "grammy";
 import { pathToFileURL } from "url";
+import { formatApprovalResponse, parseApprovalCallbackData } from "./approval";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -1249,7 +1250,35 @@ bot.command("rule_modify", async (ctx) => {
   await ctx.reply(`Descrie modificarea pentru ${ruleId}:`);
 });
 
-// /luna [qwen|mistral] command - activate Luna or switch model
+const LUNA_MODEL_PRESETS: Record<string, { backend: "openrouter" | "ollama"; model: string; label: string }> = {
+  mistral: {
+    backend: "ollama",
+    model: "dolphin-mistral",
+    label: "dolphin-mistral (ollama)",
+  },
+  samantha: {
+    backend: "ollama",
+    model: "samantha-mistral",
+    label: "samantha-mistral (ollama)",
+  },
+  hermes: {
+    backend: "openrouter",
+    model: "nousresearch/hermes-4-70b",
+    label: "nousresearch/hermes-4-70b (openrouter)",
+  },
+  minimax: {
+    backend: "openrouter",
+    model: "minimax/minimax-m2-her",
+    label: "minimax/minimax-m2-her (openrouter)",
+  },
+  cydonia: {
+    backend: "openrouter",
+    model: "thedrummer/cydonia-24b-v4.1",
+    label: "thedrummer/cydonia-24b-v4.1 (openrouter)",
+  },
+};
+
+// /luna [preset] command - activate Luna or switch model
 bot.command("luna", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (typeof chatId !== "number") return;
@@ -1257,20 +1286,35 @@ bot.command("luna", async (ctx) => {
   const arg = ctx.match?.trim().toLowerCase();
 
   if (arg === "reset") {
+    console.log(`[LUNA] Reset requested for chat ${chatId}`);
     const firstMessage = resetLuna(chatId);
+    console.log(`[LUNA] Reset complete, first message: ${firstMessage.slice(0, 60)}...`);
     await sendResponse(ctx, firstMessage);
     return;
   }
 
-  if (arg === "qwen") {
-    setLunaModel("qwen3-abliterated:8b");
-    await ctx.reply(`Model schimbat: qwen3-abliterated:8b. Conversația continuă.`);
+  if (arg === "openrouter") {
+    setLunaBackend("openrouter");
+    await ctx.reply(`Backend: openrouter (${getLunaModel()})`);
     return;
   }
 
-  if (arg === "mistral") {
-    setLunaModel("dolphin-mistral");
-    await ctx.reply(`Model schimbat: dolphin-mistral. Conversația continuă.`);
+  if (arg === "ollama") {
+    setLunaBackend("ollama");
+    await ctx.reply(`Backend: ollama (${getLunaModel()})`);
+    return;
+  }
+
+  if (arg === "status") {
+    await ctx.reply(`Backend: ${getLunaBackend()}\nModel: ${getLunaModel()}`);
+    return;
+  }
+
+  if (arg && LUNA_MODEL_PRESETS[arg]) {
+    const preset = LUNA_MODEL_PRESETS[arg];
+    setLunaBackend(preset.backend);
+    setLunaModel(preset.model);
+    await ctx.reply(`Model: ${preset.label}`);
     return;
   }
 
@@ -1280,7 +1324,7 @@ bot.command("luna", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Luna activă. Sesiunea anterioară a fost restaurată.");
+  await ctx.reply("Luna active. Previous session restored.");
 });
 
 // /exit command - deactivate Luna mode and return to default relay flow
@@ -1300,10 +1344,65 @@ const APPROVAL_RESPONSE_PATH = join(
   process.env.HOME || "~",
   ".nexus/workspace/intel/APPROVAL-RESPONSE.md"
 );
+const APPROVAL_REQUEST_PATH = join(
+  process.env.HOME || "~",
+  ".nexus/workspace/intel/APPROVAL-REQUEST.md"
+);
+
+function extractTaskIdFromText(text: string): string | null {
+  const match = text.match(/task:\s*([A-Za-z0-9-]+)/i);
+  return match?.[1] || null;
+}
+
+async function resolvePendingApprovalTaskId(): Promise<string | null> {
+  try {
+    const pending = await readFile(APPROVAL_RESPONSE_PATH, "utf-8");
+    if (pending.includes("status: PENDING")) {
+      const taskIdMatch = pending.match(/task_id:\s*\"?([^\"\\n]+)\"?/);
+      if (taskIdMatch?.[1]) return taskIdMatch[1];
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const request = await readFile(APPROVAL_REQUEST_PATH, "utf-8");
+    const taskIdMatch = request.match(/task_id:\s*\"?([^\"\\n]+)\"?/);
+    if (taskIdMatch?.[1]) return taskIdMatch[1];
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+async function writeApprovalDecision(
+  ctx: Context,
+  opts: { taskId: string; decision: string; status: string; reason?: string; redirectAgent?: string }
+): Promise<void> {
+  const response = formatApprovalResponse({
+    taskId: opts.taskId,
+    status: opts.status as "APPROVED" | "REJECTED" | "REDIRECTED",
+    decision: opts.decision as "GO" | "VETO" | "REDIRECT",
+    reason: opts.reason,
+    redirectAgent: opts.redirectAgent,
+    decisionBy: "Pafi",
+  });
+
+  await writeFile(APPROVAL_RESPONSE_PATH, response);
+
+  const emoji = opts.decision === "GO" ? "✅" : opts.decision === "VETO" ? "❌" : "↪️";
+  const extra = opts.reason ? ` — ${opts.reason}` : "";
+  const agentNote = opts.redirectAgent ? ` → ${opts.redirectAgent}` : "";
+  await ctx.reply(`${emoji} Approval ${opts.decision} for task ${opts.taskId}${agentNote}${extra}`);
+
+  console.log(
+    `[APPROVAL] ${opts.decision} task=${opts.taskId} redirect=${opts.redirectAgent || ""} reason=${opts.reason || ""}`
+  );
+}
 
 async function handleApprovalResponse(ctx: Context, text: string): Promise<boolean> {
   const trimmed = text.trim();
-  const upper = trimmed.toUpperCase();
 
   // Only match approval patterns: OK/GO/APPROVE, REJECT/VETO, REDIRECT <agent>
   const isApprove = /^(OK|GO|APPROVE)\b/i.test(trimmed);
@@ -1314,23 +1413,12 @@ async function handleApprovalResponse(ctx: Context, text: string): Promise<boole
     return false;
   }
 
-  // Check if there's a pending approval
-  let pending = "";
-  try {
-    pending = await readFile(APPROVAL_RESPONSE_PATH, "utf-8");
-  } catch {
-    return false; // No file = no pending approval
+  let taskId = await resolvePendingApprovalTaskId();
+  if (!taskId && ctx.message?.reply_to_message?.text) {
+    taskId = extractTaskIdFromText(ctx.message.reply_to_message.text) || null;
   }
+  if (!taskId) return false;
 
-  if (!pending.includes("status: PENDING")) {
-    return false; // Not in PENDING state
-  }
-
-  // Extract task_id from existing PENDING response
-  const taskIdMatch = pending.match(/task_id:\s*"?([^"\n]+)"?/);
-  const taskId = taskIdMatch?.[1] || "unknown";
-
-  const now = new Date().toISOString();
   let decision = "";
   let status = "";
   let reason = "";
@@ -1351,39 +1439,21 @@ async function handleApprovalResponse(ctx: Context, text: string): Promise<boole
     reason = parts.slice(1).join(" ") || "";
   }
 
-  // Sanitize user-derived fields to prevent YAML injection (strip quotes, newlines)
-  const safeReason = reason.replace(/["\n\r]/g, " ").trim();
-  const safeRedirect = redirectAgent.replace(/[^a-z0-9_-]/gi, "").trim();
-
-  // Write APPROVAL-RESPONSE.md (NEXUS-MESSAGING-PROTOCOL envelope)
-  const response = `---
-msg_type: approval
-from: relay
-to: genie
-correlation_id: "${taskId}"
-timestamp: "${now}"
-in_reply_to: "${taskId}"
----
-status: ${status}
-task_id: "${taskId}"
-decision: "${decision}"
-responded_by: "pafi"
-responded_via: "telegram"
-reason: "${safeReason}"
-redirect_agent: "${safeRedirect}"
-`;
-
-  await writeFile(APPROVAL_RESPONSE_PATH, response);
-
-  // Confirm to Pafi
-  const emoji = decision === "GO" ? "✅" : decision === "VETO" ? "❌" : "↪️";
-  const extra = reason ? ` — ${reason}` : "";
-  const agentNote = redirectAgent ? ` → ${redirectAgent}` : "";
-  await ctx.reply(`${emoji} Approval ${decision} for task ${taskId}${agentNote}${extra}`);
-
-  console.log(`[APPROVAL] ${decision} task=${taskId} redirect=${redirectAgent} reason=${reason}`);
+  await writeApprovalDecision(ctx, { taskId, decision, status, reason, redirectAgent });
   return true;
 }
+
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  const parsed = parseApprovalCallbackData(data);
+  if (!parsed) return;
+
+  const decision = parsed.action === "APPROVE" ? "GO" : "VETO";
+  const status = parsed.action === "APPROVE" ? "APPROVED" : "REJECTED";
+
+  await writeApprovalDecision(ctx, { taskId: parsed.taskId, decision, status });
+  await ctx.answerCallbackQuery({ text: `Recorded ${parsed.action}` });
+});
 
 // Text messages
 bot.on("message:text", async (ctx) => {
@@ -1396,11 +1466,37 @@ bot.on("message:text", async (ctx) => {
     }
   }
   if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
+    // Skip bot commands — let bot.command() handlers process them
+    if (text.startsWith("/luna") || text.startsWith("/exit")) {
+      return;
+    }
     try {
+      if (text.startsWith("/training")) {
+        const label = text.replace("/training", "").trim().toUpperCase() || "A";
+        // Map: /training A, /training B, etc. or full filename
+        const fileMap: Record<string, string> = {
+          "A": "A-sissy-feminization.txt",
+          "B": "B-slut-training.txt",
+          "C": "C-toys-bondage.txt",
+          "D": "D-chastity-orgasm.txt",
+          "E": "E-mind-control.txt",
+          "F": "F-weekly-plan.txt",
+        };
+        const filename = fileMap[label] || `${label}.txt`;
+        const macro = readTrainingAsset(filename);
+        if (!macro) {
+          await ctx.reply(`Macro ${label} not found. Available: A, B, C, D, E, F`);
+          return;
+        }
+        const trainingResponse = await sendToLuna(lunaChatId, macro);
+        await sendResponse(ctx, trainingResponse);
+        return;
+      }
+
       if (text.startsWith("/story:")) {
         const storyText = text.slice(7).trim();
         if (!storyText) {
-          await ctx.reply("Trimite `/story: [text]` cu povestea pe care vrei s-o analizeze Luna.");
+          await ctx.reply("Send `/story: [text]` with the story you want Luna to analyze.");
           return;
         }
 
@@ -1415,7 +1511,7 @@ bot.on("message:text", async (ctx) => {
       await sendResponse(ctx, lunaResponse);
     } catch (error) {
       console.error("Luna handler error:", error);
-      await ctx.reply("Luna nu e disponibilă acum. Ollama offline?");
+      await ctx.reply("Luna is not available right now. Ollama offline?");
     }
     return;
   }
