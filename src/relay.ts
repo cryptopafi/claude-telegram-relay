@@ -28,6 +28,7 @@ import {
   CortexRulesCache,
   loadContextForMessage,
   type ContextResult,
+  type Intent,
 } from "./context-loader";
 import {
   processCortexMemoryIntents,
@@ -291,6 +292,20 @@ bot.use(async (ctx, next) => {
 // ============================================================
 
 type ModelLevel = "haiku" | "sonnet" | "opus";
+type PromptForgeClass = "TRIVIAL" | "STANDARD" | "COMPLEX" | "PRODUCTION";
+type PromptForgeMode = "skip" | "light" | "full";
+type PromptForgeVisibility = "silent" | "visible";
+
+interface PromptForgeGateDecision {
+  enabled: boolean;
+  mode: PromptForgeMode;
+  visibility: PromptForgeVisibility;
+  promptClass: PromptForgeClass;
+  explicitTrigger: boolean;
+  reason: string;
+  normalizedUserMessage: string;
+  intent: Intent;
+}
 
 const OPUS_PATTERNS = [
   /\b(design|architect|plan|strategy|strategic)\b/i,
@@ -310,6 +325,124 @@ const SONNET_PATTERNS = [
   /\b(script|function|class|api|endpoint)\b/i,
   /\b(install|configure|setup|deploy)\b/i,
 ];
+
+const PROMPTFORGE_EXPLICIT_TRIGGER = /^\s*(\/opt\b|optimize\b|opt\b)/i;
+const PROMPTFORGE_TRIVIAL_ONLY = /^\s*(ok|okay|k|da|yes|nu|no|mersi|merci|multumesc|mulțumesc|thanks|thx|super)\s*[.!?]*\s*$/i;
+const PROMPTFORGE_CHITCHAT = /^\s*(salut|hello|hi|hey|ce faci|how are you|neata|bună|buna)\b/i;
+const PROMPTFORGE_COMPLEX_MARKERS =
+  /\b(implement|build|refactor|debug|audit|research|analyze|design|architecture|workflow|pipeline|multi[- ]?agent|routing|hardening|security)\b/i;
+const PROMPTFORGE_PRODUCTION_MARKERS =
+  /\b(production|prod|deploy|migration|rollback|legal|compliance|financial|payment|security review|incident)\b/i;
+
+function stripPromptForgeTrigger(text: string): string {
+  return text.replace(/^\s*\/opt\b/i, "").replace(/^\s*optimize\b/i, "").replace(/^\s*opt\b/i, "").trim();
+}
+
+function isPromptForgeTrivial(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return true;
+  if (normalized.length < 50 && (PROMPTFORGE_TRIVIAL_ONLY.test(normalized) || PROMPTFORGE_CHITCHAT.test(normalized))) {
+    return true;
+  }
+  if (normalized.length <= 20 && /^[\p{L}\p{N}\s.!?,-]+$/u.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function decidePromptForgeGate(rawText: string): PromptForgeGateDecision {
+  const explicitTrigger = PROMPTFORGE_EXPLICIT_TRIGGER.test(rawText);
+  const normalizedUserMessage = explicitTrigger ? stripPromptForgeTrigger(rawText) : rawText.trim();
+  const intent = classifyMessageIntent(normalizedUserMessage);
+
+  if (!normalizedUserMessage) {
+    return {
+      enabled: false,
+      mode: "skip",
+      visibility: explicitTrigger ? "visible" : "silent",
+      promptClass: "TRIVIAL",
+      explicitTrigger,
+      reason: "empty-after-trigger",
+      normalizedUserMessage: "",
+      intent: "simple_chat",
+    };
+  }
+
+  if (!explicitTrigger && normalizedUserMessage.startsWith("/")) {
+    return {
+      enabled: false,
+      mode: "skip",
+      visibility: "silent",
+      promptClass: "TRIVIAL",
+      explicitTrigger: false,
+      reason: "command-message",
+      normalizedUserMessage,
+      intent,
+    };
+  }
+
+  if (!explicitTrigger && isPromptForgeTrivial(normalizedUserMessage)) {
+    return {
+      enabled: false,
+      mode: "skip",
+      visibility: "silent",
+      promptClass: "TRIVIAL",
+      explicitTrigger: false,
+      reason: "trivial-message",
+      normalizedUserMessage,
+      intent,
+    };
+  }
+
+  const isProduction = PROMPTFORGE_PRODUCTION_MARKERS.test(normalizedUserMessage);
+  const isComplex =
+    PROMPTFORGE_COMPLEX_MARKERS.test(normalizedUserMessage) ||
+    intent === "code_task" ||
+    intent === "research_query" ||
+    intent === "audit_request" ||
+    intent === "system_op";
+
+  const promptClass: PromptForgeClass = isProduction ? "PRODUCTION" : isComplex ? "COMPLEX" : "STANDARD";
+  const mode: PromptForgeMode = promptClass === "STANDARD" ? "light" : "full";
+
+  return {
+    enabled: true,
+    mode,
+    visibility: explicitTrigger ? "visible" : "silent",
+    promptClass,
+    explicitTrigger,
+    reason: explicitTrigger ? "manual-trigger" : "non-trivial",
+    normalizedUserMessage,
+    intent,
+  };
+}
+
+function buildPromptForgeGateBlock(decision: PromptForgeGateDecision): string {
+  const lines = [
+    `enabled=${decision.enabled ? "true" : "false"}`,
+    `class=${decision.promptClass}`,
+    `mode=${decision.mode}`,
+    `visibility=${decision.visibility}`,
+    `reason=${decision.reason}`,
+  ];
+
+  if (!decision.enabled) {
+    lines.push("instruction=Skip PromptForge. Respond normally.");
+    return lines.join("\n");
+  }
+
+  if (decision.visibility === "visible") {
+    lines.push(
+      "instruction=Run PromptForge explicitly. Return an optimized prompt and concise notes. Do not execute the optimized task."
+    );
+  } else {
+    lines.push(
+      "instruction=Run PromptForge internally (silent). Do not mention PromptForge; return only the direct final answer."
+    );
+  }
+
+  return lines.join("\n");
+}
 
 function detectModelLevel(text: string): ModelLevel {
   // Opus: design, architecture, strategy, complex reasoning
@@ -1674,7 +1807,15 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
-    if (isEnabled("FEATURE_SMART_DISPATCH")) {
+    const promptForgeDecision = decidePromptForgeGate(text);
+    const promptForgeGateBlock = buildPromptForgeGateBlock(promptForgeDecision);
+    const inputText = promptForgeDecision.normalizedUserMessage || text;
+    console.log(
+      `[PROMPTFORGE_GATE] class=${promptForgeDecision.promptClass} mode=${promptForgeDecision.mode} visibility=${promptForgeDecision.visibility} enabled=${promptForgeDecision.enabled} reason=${promptForgeDecision.reason}`
+    );
+
+    // /opt manual trigger should stay in Lis path and not be intercepted by Smart Dispatch.
+    if (!promptForgeDecision.explicitTrigger && isEnabled("FEATURE_SMART_DISPATCH")) {
       const dispatchResult = await dispatch.handle(text, chatId);
       if (dispatchResult.promptHint) {
         dispatchPromptHint = dispatchResult.promptHint;
@@ -1692,42 +1833,54 @@ bot.on("message:text", async (ctx) => {
     await storeTelegramMessage("user", text);
 
     const contextOptimizationEnabled = isEnabled("FEATURE_CONTEXT_OPTIMIZATION");
-    const urlContentsPromise = extractUrlContent(text);
+    const urlContentsPromise = extractUrlContent(inputText);
     const buildPromptStart = Date.now();
     let enrichedPrompt = "";
 
     if (contextOptimizationEnabled) {
-      const intent = classifyMessageIntent(text);
-      const optimizedContext = await loadContextForMessage(text, intent, chatHistory, {
+      const intent = promptForgeDecision.intent;
+      const optimizedContext = await loadContextForMessage(inputText, intent, chatHistory, {
         systemPromptTemplate,
         rulesCache: cortexRulesCache,
-        loadMemorySummary: () => memoryContextFor(text),
+        loadMemorySummary: () => memoryContextFor(inputText),
         loadCortexContext: getCortexContext,
         loadCortexProcedures: getCortexProcedures,
         loadSharedMemory: loadSharedMemory,
       });
-      enrichedPrompt = buildPromptFromOptimizedContext(text, optimizedContext, dispatchPromptHint);
+      enrichedPrompt = buildPromptFromOptimizedContext(
+        inputText,
+        optimizedContext,
+        dispatchPromptHint,
+        promptForgeGateBlock
+      );
       console.log(
-        `[CONTEXT_OPT] intent=${intent} tier=${optimizedContext.tier} total_chars=${optimizedContext.totalChars}`
+        `[CONTEXT_OPT] intent=${intent} tier=${optimizedContext.tier} total_chars=${optimizedContext.totalChars} promptforge=${promptForgeDecision.promptClass}/${promptForgeDecision.mode}/${promptForgeDecision.visibility}`
       );
     } else {
       // Legacy path (backward-compatible): full context load
       const [sharedMemory, cortexContext, cortexRules, cortexProcedures] = await Promise.all([
         loadSharedMemory(),
-        getCortexContext(text),
+        getCortexContext(inputText),
         cortexRulesCache.getRules(),
-        getCortexProcedures(text),
+        getCortexProcedures(inputText),
       ]);
 
       const history = formatHistory();
-      enrichedPrompt = buildPrompt(text, sharedMemory, cortexContext, cortexRules, dispatchPromptHint);
+      enrichedPrompt = buildPrompt(
+        inputText,
+        sharedMemory,
+        cortexContext,
+        cortexRules,
+        dispatchPromptHint,
+        promptForgeGateBlock
+      );
       if (cortexProcedures) {
         enrichedPrompt += "\n\n" + cortexProcedures;
       }
       if (history) {
         enrichedPrompt = history + "\n\n" + enrichedPrompt;
       }
-      const memCtx = memoryContextFor(text);
+      const memCtx = memoryContextFor(inputText);
       if (memCtx) {
         enrichedPrompt = memCtx + "\n\n" + enrichedPrompt;
       }
@@ -1740,7 +1893,7 @@ bot.on("message:text", async (ctx) => {
     }
 
     traceBuildPromptMs = Date.now() - buildPromptStart;
-    const model = detectModelLevel(text); // Detect from user's original message, not enriched prompt
+    const model = detectModelLevel(inputText);
     traceModel = model;
     const rawResponse = await enqueueClaudeJob(() => callClaude(enrichedPrompt, { resume: true, model }));
 
@@ -1840,11 +1993,16 @@ Groq Whisper nu a putut procesa audio-ul (${voice.duration}s). Încearcă din no
       getCortexProcedures(transcription),
     ]);
 
+    const voicePromptForgeDecision = decidePromptForgeGate(transcription);
+    const voicePromptForgeGateBlock = buildPromptForgeGateBlock(voicePromptForgeDecision);
+
     let enrichedPrompt = buildPrompt(
       `[Voice message transcribed]: ${transcription}`,
       undefined,
       cortexContext,
-      cortexRules
+      cortexRules,
+      undefined,
+      voicePromptForgeGateBlock
     );
     if (cortexProcedures) {
       enrichedPrompt += "\n\n" + cortexProcedures;
@@ -2160,7 +2318,8 @@ function buildPrompt(
   sharedMemory?: string,
   cortexContext?: string,
   cortexRules?: string,
-  dispatchHint?: string
+  dispatchHint?: string,
+  promptForgeGate?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -2201,6 +2360,9 @@ function buildPrompt(
 
     const parts = [prompt];
     if (dispatchHint) parts.push(`\n<dispatch_hint>\n${escapeXmlContent(dispatchHint)}\n</dispatch_hint>`);
+    if (promptForgeGate) {
+      parts.push(`\n<promptforge_gate>\n${escapeXmlContent(promptForgeGate)}\n</promptforge_gate>`);
+    }
     if (cortexRules) parts.push(`\n<cortex_rules>\n${escapeXmlContent(cortexRules)}\n</cortex_rules>`);
     if (sharedMemory) parts.push(`\n<shared_memory>\n${escapeXmlContent(sharedMemory)}\n</shared_memory>`);
     if (cortexContext) parts.push(`\n<cortex_context>\n${escapeXmlContent(cortexContext)}\n</cortex_context>`);
@@ -2215,6 +2377,7 @@ function buildPrompt(
   ];
   if (USER_NAME) parts.push(`You are speaking with ${USER_NAME}.`);
   parts.push(`Current time: ${timeStr} (${timeOfDay})`);
+  if (promptForgeGate) parts.push(`\nPromptForge gate:\n${promptForgeGate}`);
   if (cortexRules) parts.push(`\n${cortexRules}`);
   if (dispatchHint) parts.push(`\nDispatch hint:\n${dispatchHint}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
@@ -2229,7 +2392,8 @@ function buildPrompt(
 function buildPromptFromOptimizedContext(
   userMessage: string,
   context: ContextResult,
-  dispatchHint?: string
+  dispatchHint?: string,
+  promptForgeGate?: string
 ): string {
   const now = new Date();
   const timeStr = now.toLocaleString("en-US", {
@@ -2271,6 +2435,9 @@ function buildPromptFromOptimizedContext(
     if (dispatchHint) {
       parts.push(`\n<dispatch_hint>\n${escapeXmlContent(dispatchHint)}\n</dispatch_hint>`);
     }
+    if (promptForgeGate) {
+      parts.push(`\n<promptforge_gate>\n${escapeXmlContent(promptForgeGate)}\n</promptforge_gate>`);
+    }
     if (contextPayload) {
       parts.push(
         `\n<context_blocks tier=\"${context.tier}\" total_chars=\"${context.totalChars}\">\n${escapeXmlContent(contextPayload)}\n</context_blocks>`
@@ -2285,6 +2452,7 @@ function buildPromptFromOptimizedContext(
     `Current time: ${timeStr} (${timeOfDay})`,
   ];
   if (dispatchHint) parts.push(`\nDispatch hint:\n${dispatchHint}`);
+  if (promptForgeGate) parts.push(`\nPromptForge gate:\n${promptForgeGate}`);
   if (profileContext) parts.push(`\nProfile:\n${profileContext}`);
   if (contextPayload) parts.push(`\n${contextPayload}`);
   parts.push(`\nUser: ${userMessage}`);
