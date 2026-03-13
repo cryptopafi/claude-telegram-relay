@@ -80,6 +80,13 @@ const TASKS_REPO_DIR = "/Users/pafi/.claude/projects/-Users-pafi";
 const NEXUS_TASKS_DIR = "/Users/pafi/.nexus/tasks";
 const NEXUS_WORKSPACE_DIR = "/Users/pafi/.nexus/workspace";
 const NEXUS_SCRIPTS_DIR = "/Users/pafi/.nexus/scripts";
+const IRIS_AGENT_DIR = join(process.env.HOME || "~", ".nexus", "agents", "iris");
+const IRIS_PROGRESS_PATH = join(IRIS_AGENT_DIR, "PROGRESS.md");
+const IRIS_HEARTBEAT_PATH = join(IRIS_AGENT_DIR, "heartbeat");
+const IRIS_INTEL_DIR = join(process.env.HOME || "~", ".nexus", "workspace", "intel");
+const IRIS_REQUEST_PATH = join(IRIS_INTEL_DIR, "IRIS-REQUEST.md");
+const IRIS_OUTPUT_PATH = join(IRIS_INTEL_DIR, "IRIS-OUTPUT.md");
+const IRIS_PENDING_DISPATCH_PATH = join(IRIS_INTEL_DIR, ".iris-pending-dispatch.json");
 const CANCELLABLE_TASK_STATES = new Set(["IDLE", "DISPATCHED", "CLAIMED", "BLOCKED"]);
 const TRANSITION_LOG = "/Users/pafi/.nexus/workspace/logs/state-transitions.log";
 
@@ -145,6 +152,233 @@ function applyLunaSpeakerTag(chatId: number, text: string): string {
   if (mode === "master") return `[MASTER] ${text}`;
   if (mode === "dual") return `[LUNA+MASTER] ${text}`;
   return `[LUNA] ${text}`;
+}
+
+type IrisState = "IDLE" | "EXECUTING" | "DONE" | "FAILED" | "BLOCKED" | "UNKNOWN";
+
+interface IrisProgressState {
+  state: IrisState;
+  taskId: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  blockedReason: string | null;
+  notes: string | null;
+}
+
+interface IrisPendingDispatch {
+  corrId: string;
+  topic: string;
+  dispatchedAt: string;
+}
+
+interface IrisOutputState {
+  status: string | null;
+  eprScore: string | null;
+  summary: string | null;
+}
+
+async function readOptionalText(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+function stripWrappedQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function normalizeScalar(value: string | null): string | null {
+  if (value === null) return null;
+  const normalized = stripWrappedQuotes(value).trim();
+  if (!normalized || normalized.toLowerCase() === "null") {
+    return null;
+  }
+  return normalized;
+}
+
+function readScalarField(content: string, field: string): string | null {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = content.match(new RegExp(`^\\s*${escapedField}:\\s*(.+?)\\s*$`, "m"));
+  return normalizeScalar(match?.[1] || null);
+}
+
+function compactSingleLine(text: string, maxLength: number): string {
+  const compacted = text.replace(/\s+/g, " ").trim();
+  if (compacted.length <= maxLength) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function parseIrisState(rawState: string | null): IrisState {
+  if (rawState === "IDLE" || rawState === "EXECUTING" || rawState === "DONE" || rawState === "FAILED" || rawState === "BLOCKED") {
+    return rawState;
+  }
+  return "UNKNOWN";
+}
+
+async function loadIrisProgress(): Promise<IrisProgressState> {
+  const content = await readOptionalText(IRIS_PROGRESS_PATH);
+  if (!content) {
+    return {
+      state: "IDLE",
+      taskId: null,
+      startedAt: null,
+      updatedAt: null,
+      blockedReason: null,
+      notes: null,
+    };
+  }
+
+  return {
+    state: parseIrisState(readScalarField(content, "status")),
+    taskId: readScalarField(content, "task_id"),
+    startedAt: readScalarField(content, "started_at"),
+    updatedAt: readScalarField(content, "updated_at"),
+    blockedReason: readScalarField(content, "blocked_reason"),
+    notes: readScalarField(content, "notes"),
+  };
+}
+
+async function loadIrisPendingDispatch(): Promise<IrisPendingDispatch | null> {
+  const content = await readOptionalText(IRIS_PENDING_DISPATCH_PATH);
+  if (!content) return null;
+
+  try {
+    const parsed = JSON.parse(content) as Partial<{
+      corr_id: string;
+      topic: string;
+      dispatched_at: string;
+    }>;
+
+    if (
+      typeof parsed.corr_id !== "string" ||
+      typeof parsed.topic !== "string" ||
+      typeof parsed.dispatched_at !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      corrId: parsed.corr_id,
+      topic: parsed.topic,
+      dispatchedAt: parsed.dispatched_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractMarkdownSection(content: string, title: string): string | null {
+  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = content.match(
+    new RegExp(`^##\\s+${escapedTitle}\\s*\\n([\\s\\S]*?)(?=^##\\s+|\\Z)`, "im")
+  );
+  return normalizeScalar(match?.[1] || null);
+}
+
+async function loadIrisOutput(): Promise<IrisOutputState | null> {
+  const content = await readOptionalText(IRIS_OUTPUT_PATH);
+  if (!content || !content.trim()) return null;
+
+  const summarySection = extractMarkdownSection(content, "Summary");
+  const summary = summarySection || readScalarField(content, "summary");
+
+  return {
+    status: readScalarField(content, "status"),
+    eprScore: readScalarField(content, "epr_score"),
+    summary: summary ? compactSingleLine(summary, 300) : null,
+  };
+}
+
+function formatElapsedTime(isoTimestamp: string | null): string {
+  if (!isoTimestamp) return "unknown time";
+  const timestamp = Date.parse(isoTimestamp);
+  if (Number.isNaN(timestamp)) return "unknown time";
+
+  const deltaMs = Math.max(0, Date.now() - timestamp);
+  const minutes = Math.floor(deltaMs / 60_000);
+  if (minutes < 1) return "under 1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+}
+
+function formatIrisOutputLine(
+  progress: IrisProgressState,
+  output: IrisOutputState | null
+): string {
+  if (progress.state === "DONE") {
+    const eprPart = output?.eprScore ? `EPR ${output.eprScore}` : "DONE";
+    const summaryPart = output?.summary || "output disponibil fără summary";
+    return `${eprPart} | ${summaryPart}`;
+  }
+  if (progress.state === "EXECUTING") {
+    return "în lucru...";
+  }
+  if (progress.state === "IDLE") {
+    return "nimic activ";
+  }
+  if (progress.state === "BLOCKED") {
+    return progress.blockedReason ? `BLOCKED | ${progress.blockedReason}` : "BLOCKED";
+  }
+  if (progress.state === "FAILED") {
+    return progress.blockedReason ? `FAILED | ${progress.blockedReason}` : "FAILED";
+  }
+  if (output?.summary) {
+    return output.summary;
+  }
+  return "status necunoscut";
+}
+
+async function cancelTaskById(rawTaskId: string): Promise<string> {
+  const taskId = sanitizeCancelTaskId(rawTaskId);
+  if (!taskId) {
+    return "Folosire: /cancel <task-id>";
+  }
+
+  if (!/^[A-Za-z0-9-]+$/.test(taskId)) {
+    return "Invalid task-id. Use only alphanumeric characters and hyphen.";
+  }
+
+  const progress = readTaskProgress(taskId);
+  if (!progress) {
+    return `Task ${taskId} not found.`;
+  }
+
+  const currentState = getProgressState(progress.content);
+  if (!CANCELLABLE_TASK_STATES.has(currentState)) {
+    return `Cannot cancel task in ${currentState} state`;
+  }
+
+  const now = new Date().toISOString();
+  let updatedProgress = progress.content.replace(/^\s*status:\s*.*$/m, "status: CANCELLED");
+  if (/^\s*updated_at:\s*.*$/m.test(updatedProgress)) {
+    updatedProgress = updatedProgress.replace(/^\s*updated_at:\s*.*$/m, `updated_at: "${now}"`);
+  } else {
+    updatedProgress = `${updatedProgress.trimEnd()}\nupdated_at: "${now}"\n`;
+  }
+
+  writeFileSync(progress.path, updatedProgress);
+
+  try {
+    const logDir = dirname(TRANSITION_LOG);
+    mkdirSync(logDir, { recursive: true });
+    appendFileSync(TRANSITION_LOG, `${now}\t${taskId}\t${currentState}\tCANCELLED\tuser:pafi\n`);
+  } catch {
+    // transition log is best-effort
+  }
+
+  return `✅ Task ${taskId} cancelled.`;
 }
 
 // ============================================================
@@ -1365,6 +1599,168 @@ bot.command("rules", async (ctx) => {
   }
 });
 
+// /status command - report Lis/IRIS state directly from local files
+bot.command("status", async (ctx) => {
+  const [progress, pendingDispatch] = await Promise.all([
+    loadIrisProgress(),
+    loadIrisPendingDispatch(),
+  ]);
+
+  const taskId = progress.taskId || "n/a";
+  const pendingLine = pendingDispatch
+    ? `${pendingDispatch.topic} (dispatched ${formatElapsedTime(pendingDispatch.dispatchedAt)} ago)`
+    : "niciun dispatch activ";
+  const stateLine =
+    progress.state === "BLOCKED" && progress.blockedReason
+      ? `${progress.state} | ${progress.blockedReason}`
+      : progress.state;
+
+  await ctx.reply(
+    "🤖 Lis Status\n" +
+      `• Task activ: ${progress.state} | ${taskId}\n` +
+      `• IRIS pending: ${pendingLine}\n` +
+      `• IRIS state: ${stateLine}`
+  );
+});
+
+// /iris command - detailed IRIS status directly from local files
+bot.command("iris", async (ctx) => {
+  const [progress, output, heartbeatRaw] = await Promise.all([
+    loadIrisProgress(),
+    loadIrisOutput(),
+    readOptionalText(IRIS_HEARTBEAT_PATH),
+  ]);
+
+  const startedAt = progress.startedAt || "n/a";
+  const heartbeat = heartbeatRaw?.trim() || "n/a";
+  const outputLine = formatIrisOutputLine(progress, output);
+
+  await ctx.reply(
+    "🔬 IRIS Status\n" +
+      `• State: ${progress.state} | Started: ${startedAt}\n` +
+      `• Last heartbeat: ${heartbeat}\n` +
+      `• Output: ${outputLine}`
+  );
+});
+
+// /cancel command - reset IRIS state directly from local files
+bot.command("cancel", async (ctx) => {
+  const arg = ctx.match?.trim() || "";
+
+  if (arg) {
+    await ctx.reply(await cancelTaskById(arg));
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const progressContent =
+    "---\n" +
+    'msg_type: "status"\n' +
+    'from: "iris"\n' +
+    'to: "genie"\n' +
+    'correlation_id: "iris-status"\n' +
+    `timestamp: "${now}"\n` +
+    "---\n" +
+    "status: IDLE\n" +
+    "task_id: null\n" +
+    'agent: "iris"\n' +
+    "started_at: null\n" +
+    `updated_at: "${now}"\n` +
+    `cleared_at: "${now}"\n` +
+    "blocked_since: null\n" +
+    "blocked_reason: null\n" +
+    "output_location: null\n" +
+    "confidence: null\n" +
+    'notes: "Reset via /cancel command"\n' +
+    "spent_usd: 0.00\n" +
+    "model_calls: []\n";
+
+  await mkdir(IRIS_INTEL_DIR, { recursive: true });
+  await mkdir(IRIS_AGENT_DIR, { recursive: true });
+  await Promise.all([
+    unlink(IRIS_REQUEST_PATH).catch(() => {}),
+    unlink(IRIS_PENDING_DISPATCH_PATH).catch(() => {}),
+    writeFile(IRIS_PROGRESS_PATH, progressContent),
+  ]);
+
+  await ctx.reply("✅ Task anulat. IRIS resetat la IDLE.");
+});
+
+// /research command - dispatch IRIS research request directly from local files
+bot.command("research", async (ctx) => {
+  const topic = ctx.match?.trim() || "";
+  if (!topic) {
+    await ctx.reply("Folosire: /research [topic]");
+    return;
+  }
+
+  const progress = await loadIrisProgress();
+  if (progress.state === "EXECUTING") {
+    await ctx.reply("⏳ IRIS ocupat. Folosește /status pentru detalii.");
+    return;
+  }
+
+  const now = new Date();
+  const isoNow = now.toISOString();
+  const dateStamp = isoNow.slice(0, 10).replace(/-/g, "");
+  const corrId = `genie-${dateStamp}-${Date.now()}-research`;
+  const safeTopic = compactSingleLine(topic, 500);
+  const requestContent =
+    "---\n" +
+    "msg_type: request\n" +
+    "from: genie\n" +
+    "to: iris\n" +
+    `correlation_id: "${corrId}"\n` +
+    `timestamp: "${isoNow}"\n` +
+    "priority: normal\n" +
+    "---\n" +
+    `topic: ${JSON.stringify(safeTopic)}\n` +
+    "depth: deep\n" +
+    "requested_by: pafi\n" +
+    "context: Dispatch manual via /research command\n" +
+    "output_location: ~/.nexus/workspace/output/iris/\n";
+  const pendingDispatch = JSON.stringify(
+    {
+      corr_id: corrId,
+      topic: safeTopic,
+      dispatched_at: isoNow,
+    },
+    null,
+    0
+  );
+
+  await mkdir(IRIS_INTEL_DIR, { recursive: true });
+  await Promise.all([
+    writeFile(IRIS_REQUEST_PATH, requestContent),
+    writeFile(IRIS_PENDING_DISPATCH_PATH, pendingDispatch),
+  ]);
+
+  await ctx.reply(
+    "🔬 Research dispatched → IRIS\n" +
+      `Topic: ${safeTopic}\n` +
+      "Depth: deep\n" +
+      "ETA: ~60min (next heartbeat)"
+  );
+});
+
+// /restart command - restart Lis via launchctl after immediate acknowledgement
+bot.command("restart", async (ctx) => {
+  await ctx.reply("🔄 Restarting Lis... back in 5s");
+
+  const restartProc = nodeSpawn(
+    "/bin/sh",
+    [
+      "-c",
+      "launchctl stop com.claude.telegram-relay; sleep 1; launchctl start com.claude.telegram-relay",
+    ],
+    {
+      detached: true,
+      stdio: "ignore",
+    }
+  );
+  restartProc.unref();
+});
+
 // /model command - view or switch OpenClaw agent models
 bot.command("model", async (ctx) => {
   await ctx.replyWithChatAction("typing");
@@ -1715,6 +2111,11 @@ bot.on("message:text", async (ctx) => {
   if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
     // Skip bot commands — let bot.command() handlers process them
     if (
+      text.startsWith("/status") ||
+      text.startsWith("/iris") ||
+      text.startsWith("/cancel") ||
+      text.startsWith("/research") ||
+      text.startsWith("/restart") ||
       text.startsWith("/luna") ||
       text.startsWith("/exit") ||
       text.startsWith("/master") ||
