@@ -121,18 +121,63 @@ async function saveSession(state: SessionState): Promise<void> {
 
 let session = await loadSession();
 
+type LunaSpeakerMode = "luna" | "master" | "dual";
+const lunaSpeakerModes = new Map<number, LunaSpeakerMode>();
+
+function getLunaSpeakerMode(chatId: number): LunaSpeakerMode {
+  return lunaSpeakerModes.get(chatId) || "luna";
+}
+
+function setLunaSpeakerMode(chatId: number, mode: LunaSpeakerMode): void {
+  lunaSpeakerModes.set(chatId, mode);
+}
+
+function applyLunaSpeakerTag(chatId: number, text: string): string {
+  const trimmed = text.trimStart();
+  if (
+    trimmed.startsWith("[LUNA]") ||
+    trimmed.startsWith("[MASTER]") ||
+    trimmed.startsWith("[LUNA+MASTER]")
+  ) {
+    return text;
+  }
+  const mode = getLunaSpeakerMode(chatId);
+  if (mode === "master") return `[MASTER] ${text}`;
+  if (mode === "dual") return `[LUNA+MASTER] ${text}`;
+  return `[LUNA] ${text}`;
+}
+
 // ============================================================
 // CONVERSATION HISTORY
 // ============================================================
 
 let chatHistory: ChatMessage[] = [];
+let historyLoadedFromSQLite = false;
+let historyLoggedFromSQLite = false;
 
 async function loadHistory(): Promise<void> {
   try {
     const content = await readFile(HISTORY_FILE, "utf-8");
     chatHistory = JSON.parse(content);
+    historyLoadedFromSQLite = false;
+    historyLoggedFromSQLite = false;
   } catch {
     chatHistory = [];
+    try {
+      const rows = memoryDb
+        .prepare(
+          "SELECT role, content, timestamp FROM conversation_history ORDER BY id DESC LIMIT 50"
+        )
+        .all() as Array<{ role: "user" | "assistant"; content: string; timestamp: string }>;
+      chatHistory = rows.reverse();
+      historyLoadedFromSQLite = chatHistory.length > 0;
+      historyLoggedFromSQLite = false;
+      console.log(`[HISTORY-DB] Loaded ${chatHistory.length} messages from SQLite fallback`);
+    } catch (e) {
+      chatHistory = [];
+      historyLoadedFromSQLite = false;
+      historyLoggedFromSQLite = false;
+    }
   }
 }
 
@@ -147,10 +192,25 @@ async function addToHistory(role: "user" | "assistant", content: string): Promis
     chatHistory = chatHistory.slice(-MAX_HISTORY_MESSAGES);
   }
   await writeFile(HISTORY_FILE, JSON.stringify(chatHistory, null, 2));
+  try {
+    memoryDb
+      .prepare("INSERT INTO conversation_history (role, content, timestamp) VALUES (?, ?, ?)")
+      .run(role, content.substring(0, 2000), new Date().toISOString());
+    // Keep only last 500 messages to prevent DB bloat
+    memoryDb.exec(
+      "DELETE FROM conversation_history WHERE id NOT IN (SELECT id FROM conversation_history ORDER BY id DESC LIMIT 500)"
+    );
+  } catch (e) {
+    console.error("[HISTORY-DB] Insert failed:", e);
+  }
 }
 
 function formatHistory(): string {
   if (chatHistory.length === 0) return "";
+  if (historyLoadedFromSQLite && !historyLoggedFromSQLite) {
+    console.log("[HISTORY-DB] Using SQLite history for prompt context");
+    historyLoggedFromSQLite = true;
+  }
   let historyText = "CONVERSATION HISTORY (recent messages):\n";
   let totalChars = 0;
   // Build from most recent, stop when we hit the char limit
@@ -164,8 +224,6 @@ function formatHistory(): string {
   }
   return historyText + included.join("\n");
 }
-
-await loadHistory();
 
 // ============================================================
 // LOCK FILE (prevent multiple instances)
@@ -238,9 +296,19 @@ const bot = new Bot(BOT_TOKEN);
 const dispatch = initDispatch(bot, sendTelegram);
 const memoryContext = initMemoryDB(MEMORY_DB_PATH);
 const memoryDb = memoryContext.db;
+memoryDb.exec(`
+  CREATE TABLE IF NOT EXISTS conversation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    timestamp TEXT NOT NULL
+  )
+`);
 const memorySessionId = memoryContext.sessionId;
 const cortexRulesCache = new CortexRulesCache(() => getCortexRulesContext(), 5 * 60 * 1000);
 let processedMessageCount = 0;
+
+await loadHistory();
 
 function memoryContextFor(userMessage: string): string {
   try {
@@ -1418,6 +1486,7 @@ bot.command("luna", async (ctx) => {
   if (arg === "reset") {
     console.log(`[LUNA] Reset requested for chat ${chatId}`);
     const firstMessage = resetLuna(chatId);
+    setLunaSpeakerMode(chatId, "luna");
     console.log(`[LUNA] Reset complete, first message: ${firstMessage.slice(0, 60)}...`);
     await sendResponse(ctx, firstMessage);
     return;
@@ -1449,12 +1518,58 @@ bot.command("luna", async (ctx) => {
   }
 
   const firstMessage = activateLuna(chatId);
+  setLunaSpeakerMode(chatId, "luna");
   if (firstMessage) {
     await sendResponse(ctx, firstMessage);
     return;
   }
 
   await ctx.reply("Luna active. Previous session restored.");
+});
+
+bot.command("master", async (ctx) => {
+  if (process.env.BOT_MODE !== "luna") return;
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+  if (!isLunaActive(chatId)) {
+    const firstMessage = activateLuna(chatId);
+    if (firstMessage) {
+      await sendResponse(ctx, firstMessage);
+      return;
+    }
+  }
+  setLunaSpeakerMode(chatId, "master");
+  await ctx.reply("Master mode enabled. Messages route to [MASTER].");
+});
+
+bot.command("mistress", async (ctx) => {
+  if (process.env.BOT_MODE !== "luna") return;
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+  if (!isLunaActive(chatId)) {
+    const firstMessage = activateLuna(chatId);
+    if (firstMessage) {
+      await sendResponse(ctx, firstMessage);
+      return;
+    }
+  }
+  setLunaSpeakerMode(chatId, "luna");
+  await ctx.reply("Mistress mode enabled. Messages route to [LUNA].");
+});
+
+bot.command("dual", async (ctx) => {
+  if (process.env.BOT_MODE !== "luna") return;
+  const chatId = ctx.chat?.id;
+  if (typeof chatId !== "number") return;
+  if (!isLunaActive(chatId)) {
+    const firstMessage = activateLuna(chatId);
+    if (firstMessage) {
+      await sendResponse(ctx, firstMessage);
+      return;
+    }
+  }
+  setLunaSpeakerMode(chatId, "dual");
+  await ctx.reply("Dual mode enabled. Messages route to [LUNA+MASTER].");
 });
 
 // /exit command - deactivate Luna mode and return to default relay flow
@@ -1464,6 +1579,7 @@ bot.command("exit", async (ctx) => {
   if (!isLunaActive(chatId)) return;
 
   deactivateLuna(chatId);
+  lunaSpeakerModes.delete(chatId);
   await ctx.reply("Ok, revin la normal.");
 });
 
@@ -1591,13 +1707,20 @@ bot.on("message:text", async (ctx) => {
   const lunaChatId = ctx.chat?.id;
   if (typeof lunaChatId === "number" && process.env.BOT_MODE === "luna" && !isLunaActive(lunaChatId)) {
     const firstMessage = activateLuna(lunaChatId);
+    setLunaSpeakerMode(lunaChatId, "luna");
     if (firstMessage) {
       await sendResponse(ctx, firstMessage);
     }
   }
   if (typeof lunaChatId === "number" && isLunaActive(lunaChatId)) {
     // Skip bot commands — let bot.command() handlers process them
-    if (text.startsWith("/luna") || text.startsWith("/exit")) {
+    if (
+      text.startsWith("/luna") ||
+      text.startsWith("/exit") ||
+      text.startsWith("/master") ||
+      text.startsWith("/mistress") ||
+      text.startsWith("/dual")
+    ) {
       return;
     }
     try {
@@ -1606,7 +1729,7 @@ bot.on("message:text", async (ctx) => {
         const filename = resolveTrainingAsset(label);
         const macro = readTrainingAsset(filename);
         if (!macro) {
-          await ctx.reply("Training macro not found. Available: 1, 2, 3, 4");
+          await ctx.reply("Training macro not found. Available: 1, 2, 3, 4, 5, 6");
           return;
         }
         const trainingResponse = await sendToLuna(lunaChatId, macro);
@@ -1630,7 +1753,8 @@ bot.on("message:text", async (ctx) => {
         return;
       }
 
-      const lunaResponse = await sendToLuna(lunaChatId, text);
+      const lunaInput = applyLunaSpeakerTag(lunaChatId, text);
+      const lunaResponse = await sendToLuna(lunaChatId, lunaInput);
       await sendResponse(ctx, lunaResponse);
     } catch (error) {
       console.error("Luna handler error:", error);
